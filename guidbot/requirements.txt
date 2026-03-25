@@ -1,0 +1,48 @@
+# ============================================================
+# 좋은문화병원 가이드봇 v3.0 의존성 목록
+# ============================================================
+# 설치: pip install -r requirements.txt
+# 업데이트: pip install -r requirements.txt --upgrade
+# ============================================================
+
+# ── Streamlit (웹 앱 프레임워크) ─────────────────────────────
+streamlit>=1.32.0
+
+# ── LangChain (RAG 프레임워크) ───────────────────────────────
+langchain>=0.2.0
+langchain-community>=0.2.0
+langchain-huggingface>=0.0.3
+langchain-text-splitters>=0.2.0
+
+# ── 벡터 스토어 ──────────────────────────────────────────────
+faiss-cpu>=1.7.4
+# GPU 환경이면 faiss-cpu 대신 faiss-gpu 사용:
+# faiss-gpu>=1.7.4
+
+# ── 임베딩 모델 (로컬, 무료) ─────────────────────────────────
+sentence-transformers>=2.6.0
+torch>=2.1.0                  # CPU 전용 (GPU 없어도 동작)
+# GPU 사용 시 공식 사이트에서 CUDA 버전 맞는 torch 설치:
+# https://pytorch.org/get-started/locally/
+
+# ── Google Gemini API ────────────────────────────────────────
+google-genai>=1.0.0           # google.genai 패키지 (최신 SDK)
+
+# ── PDF 처리 ─────────────────────────────────────────────────
+pypdf>=4.0.0                  # PyPDFLoader 의존성
+pdfplumber>=0.10.0            # 폴백 PDF 추출기 (표·2단 레이아웃 처리)
+
+# ── 설정 관리 ────────────────────────────────────────────────
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+
+# ── DB 연결 (선택 사항, db_enabled=True 시 필요) ─────────────
+sqlalchemy>=2.0.0
+pymysql>=1.1.0                # MySQL/MariaDB 드라이버
+# MSSQL 사용 시 추가:
+# pyodbc>=5.0.0
+# PostgreSQL 사용 시 추가:
+# psycopg2-binary>=2.9.0
+
+# ── 유틸리티 ─────────────────────────────────────────────────
+python-dotenv>=1.0.0          # .env 파일 로드 (pydantic-settings 에서 사용)

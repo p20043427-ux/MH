@@ -1,0 +1,45 @@
+[server]
+# 최초 로딩 후 파일 변경 감지 비활성화 (운영 환경)
+# 개발 시에는 true 로 변경
+runOnSave = false
+
+# headless = true 이면 브라우저 자동 실행 안 함 (서버 운영 시 권장)
+headless = true
+
+# 접속 포트
+port = 8502
+
+# 내부망 전용 바인딩 (0.0.0.0 = 전체 허용)
+address = "0.0.0.0"
+
+# 파일 업로드 최대 크기 (MB) - PDF 업로드 시
+maxUploadSize = 200
+
+# WebSocket 헤더 크기 제한 완화 (대용량 페이지 렌더링)
+maxMessageSize = 200
+
+[browser]
+# 사용 통계 수집 비활성화 (보안)
+gatherUsageStats = false
+
+# 서버 주소 표시 안 함
+serverAddress = "localhost"
+
+[theme]
+# 기본 테마 (theme.py 에서 CSS 오버라이드)
+base = "light"
+primaryColor = "#2E75B6"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0F4F8"
+textColor = "#1A3A5C"
+
+[runner]
+# 스크립트 재실행 시 위젯 상태 유지
+fastReruns = true
+
+# 매직 커맨드 비활성화 (성능 최적화)
+magicEnabled = false
+
+[logger]
+# Streamlit 내부 로그 레벨 (WARNING 이상만 표시)
+level = "warning"

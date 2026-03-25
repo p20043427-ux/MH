@@ -1,0 +1,22 @@
+{
+  "DOC_20260311_151800_3da64d71": {
+    "doc_id": "DOC_20260311_151800_3da64d71",
+    "title": "응급실 데이터 입력 지침서",
+    "category": "db_spec",
+    "file_path": "db_specs\\응급실_데이터_입력_지침서_v1_1. NEDIS 입력 지침서_Ver.4.0(20250101부터 적용).pdf",
+    "file_name": "1. NEDIS 입력 지침서_Ver.4.0(20250101부터 적용).pdf",
+    "file_size": 4718036,
+    "file_hash": "3303732b1538ad40defc97d286ba59dd561c14f5106de4ca82a3561d531807ff",
+    "tags": [
+      "응급실"
+    ],
+    "description": "응급실 데이터 입력 지침서",
+    "created_at": "2026-03-11T15:18:00.650782",
+    "updated_at": "2026-03-11T15:18:00.650782",
+    "uploaded_by": "admin",
+    "is_active": true,
+    "version": 1,
+    "vector_indexed": true,
+    "vector_indexed_at": "2026-03-17T10:43:59.420821"
+  }
+}
