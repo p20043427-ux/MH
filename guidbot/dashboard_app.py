@@ -149,7 +149,7 @@ def _render_mini_sidebar() -> None:
         # ── 링크: RAG 챗봇으로 이동 ─────────────────────────────────
         st.markdown(
             '<div style="margin-bottom:16px;">'
-            '<a href="http://192.1.1.234:8502/" target="_blank" style="'
+            '<a href="http://192.1.1.231:8501/" target="_blank" style="'
             "display:flex;align-items:center;gap:6px;"
             "background:rgba(30,64,175,0.20);border:1px solid rgba(30,64,175,0.35);"
             'border-radius:7px;padding:8px 12px;text-decoration:none;">'
