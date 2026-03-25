@@ -1,48 +1,75 @@
-# ============================================================
-# 좋은문화병원 가이드봇 v3.0 의존성 목록
-# ============================================================
-# 설치: pip install -r requirements.txt
-# 업데이트: pip install -r requirements.txt --upgrade
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════
+# 좋은문화병원 가이드봇 — requirements.txt
+# 마지막 검토: 2025-03
+# Python: 3.10 ~ 3.12 권장  (3.13 미검증)
+#
+# [설치]
+#   pip install -r requirements.txt
+#
+# [GPU 환경 (CUDA)]
+#   faiss-cpu → faiss-gpu 교체 후 설치
+#   torch는 CUDA 버전에 맞게 별도 설치:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#
+# [패키지 버전 정책]
+#   핵심 AI 패키지: >= 최소버전 고정 (호환성 검증 완료 기준)
+#   유틸 패키지:   >= 최소버전만 명시 (최신 패치 자동 적용)
+# ══════════════════════════════════════════════════════════════════════
 
-# ── Streamlit (웹 앱 프레임워크) ─────────────────────────────
-streamlit>=1.32.0
 
-# ── LangChain (RAG 프레임워크) ───────────────────────────────
-langchain>=0.2.0
-langchain-community>=0.2.0
-langchain-huggingface>=0.0.3
-langchain-text-splitters>=0.2.0
+# ── 웹 UI ─────────────────────────────────────────────────────────────
+streamlit>=1.45.0          # 대시보드 + 챗봇 UI, cache_data/cache_resource 필요
+plotly>=5.24.0             # 병동 KPI 차트, 파이/바/라인 차트
+pandas>=2.2.0              # 데이터프레임 처리, plotly 의존
 
-# ── 벡터 스토어 ──────────────────────────────────────────────
-faiss-cpu>=1.7.4
-# GPU 환경이면 faiss-cpu 대신 faiss-gpu 사용:
-# faiss-gpu>=1.7.4
 
-# ── 임베딩 모델 (로컬, 무료) ─────────────────────────────────
-sentence-transformers>=2.6.0
-torch>=2.1.0                  # CPU 전용 (GPU 없어도 동작)
-# GPU 사용 시 공식 사이트에서 CUDA 버전 맞는 torch 설치:
-# https://pytorch.org/get-started/locally/
+# ── LLM — Google Gemini ───────────────────────────────────────────────
+google-generativeai>=0.8.0 # Gemini 1.5 Flash/Pro API 클라이언트
 
-# ── Google Gemini API ────────────────────────────────────────
-google-genai>=1.0.0           # google.genai 패키지 (최신 SDK)
 
-# ── PDF 처리 ─────────────────────────────────────────────────
-pypdf>=4.0.0                  # PyPDFLoader 의존성
-pdfplumber>=0.10.0            # 폴백 PDF 추출기 (표·2단 레이아웃 처리)
+# ── RAG 파이프라인 — LangChain ─────────────────────────────────────────
+langchain>=0.3.0           # RAG 추상화 계층 (Text Splitter, Chain 등)
+langchain-core>=0.3.0      # Document, Runnable 기반 타입
+langchain-community>=0.3.0 # FAISS VectorStore, HuggingFaceEmbeddings (레거시)
+langchain-huggingface>=0.1.0  # HuggingFaceEmbeddings 최신 패키지
 
-# ── 설정 관리 ────────────────────────────────────────────────
-pydantic>=2.6.0
-pydantic-settings>=2.2.0
 
-# ── DB 연결 (선택 사항, db_enabled=True 시 필요) ─────────────
-sqlalchemy>=2.0.0
-pymysql>=1.1.0                # MySQL/MariaDB 드라이버
-# MSSQL 사용 시 추가:
-# pyodbc>=5.0.0
-# PostgreSQL 사용 시 추가:
-# psycopg2-binary>=2.9.0
+# ── 벡터 검색 ─────────────────────────────────────────────────────────
+faiss-cpu>=1.8.0           # FAISS 로컬 벡터 인덱스 (GPU 환경은 faiss-gpu로 교체)
+# faiss-gpu>=1.8.0         # GPU 환경에서만 활성화 (faiss-cpu 대신 사용)
+rank-bm25>=0.2.2           # BM25 키워드 검색 (하이브리드 RAG)
 
-# ── 유틸리티 ─────────────────────────────────────────────────
-python-dotenv>=1.0.0          # .env 파일 로드 (pydantic-settings 에서 사용)
+
+# ── 임베딩 + Cross-Encoder ────────────────────────────────────────────
+sentence-transformers>=3.0.0  # jhgan/ko-sroberta 임베딩 + CE 리랭킹
+                               # bongsoo/kpf-cross-encoder-v1 등
+
+
+# ── 딥러닝 런타임 ─────────────────────────────────────────────────────
+# torch: sentence-transformers 의존. CPU 버전 기본 설치.
+# CUDA 환경은 아래 주석 참고.
+torch>=2.1.0               # 임베딩 모델 실행 (CPU/GPU)
+numpy>=1.26.0              # 벡터 연산, FAISS 인터페이스
+
+
+# ── PDF 처리 ──────────────────────────────────────────────────────────
+pypdf>=4.0.0               # PDF 텍스트 추출 (기본 모드)
+pdfplumber>=0.10.0         # PDF 표 구조 보존 추출 (--use-markdown 모드)
+
+
+# ── Oracle DB 연동 ────────────────────────────────────────────────────
+oracledb>=2.0.0            # python-oracledb Thin Mode (Instant Client 불필요)
+                            # Oracle 11g 이상 지원 (Thick Mode: oracle_thick_mode=true)
+SQLAlchemy>=2.0.0          # DB 연결 풀, ORM (MySQL/MSSQL/PostgreSQL용 connector.py)
+
+
+# ── MySQL/MariaDB 드라이버 ────────────────────────────────────────────
+# connector.py 의 db_type=mysql 설정 시 필요.
+# Oracle만 사용한다면 주석 처리 가능.
+PyMySQL>=1.1.0             # MySQL/MariaDB SQLAlchemy 드라이버
+
+
+# ── 환경 설정 ─────────────────────────────────────────────────────────
+pydantic>=2.5.0            # settings.py BaseModel, Field, SecretStr
+pydantic-settings>=2.2.0   # BaseSettings, .env 자동 로드
+python-dotenv>=1.0.0       # .env 파일 파싱 (pydantic-settings 의존)
