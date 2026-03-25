@@ -58,12 +58,12 @@ from utils.monitor import get_metrics
 
 logger = get_logger(__name__, log_dir=settings.log_dir)
 
-_MAX_HISTORY = 15
+_MAX_HISTORY = 15 
+
 
 _TIPS: list[str] = [
     "원내 와이파이 · moonhwa_free · 별도 설정 불필요합니다",
     "병원 내 전 구역 금연입니다. 흡연은 지정 구역에서만 가능합니다.",
-    "제증명 서류는 퇴원 하루 전 미리 신청해 주세요",
     "당직 수당 계산 기준이 궁금하시면 '당직 수당'이라고 입력해 보세요",
     "연차 신청 전 취업규칙을 확인해 보세요 — 챗봇에게 물어보세요!",
 ]
