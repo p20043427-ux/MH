@@ -31,7 +31,6 @@ dashboard_app.py  ─  좋은문화병원 병동 현황 대시보드 v1.0
     streamlit run main.py --server.port 8502
 
 [VB6 연동 URL]
-    병동 대시보드: http://192.1.1.234:8503/
     (별도 page= 파라미터 불필요 — 항상 병동 화면 표시)
 
 [의존 모듈]
