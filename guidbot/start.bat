@@ -30,13 +30,13 @@ echo.
 REM ── Step 2: Streamlit 앱 실행 ──────────────────────────────
 echo  [2/2] 가이드봇 시작 중...
 echo  ─────────────────────────────────────────────
-echo  접속 주소: http://localhost:8502
+echo  접속 주소: http://localhost:8501
 echo  종료: Ctrl+C
 echo  ─────────────────────────────────────────────
 echo.
 
 streamlit run main.py ^
-    --server.port 8502 ^
+    --server.port 8501 ^
     --server.address 0.0.0.0 ^
     --server.headless true ^
     --browser.gatherUsageStats false ^
