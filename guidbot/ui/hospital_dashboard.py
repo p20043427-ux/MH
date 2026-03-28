@@ -2029,6 +2029,41 @@ def _render_ward() -> None:
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
+    # ── AI 채팅 카드 — KPI Row 상단 배치 ─────────────────────────
+    _llm_avail = True
+    try:
+        from core.llm import get_llm_client as _gc; _gc()
+    except Exception:
+        _llm_avail = False
+    _ai_badge = (
+        '<span style="display:inline-flex;align-items:center;gap:4px;font-size:10px;'
+        'background:#DCFCE7;color:#15803D;border:1px solid #86EFAC;'
+        'border-radius:4px;padding:1px 7px;font-weight:600;margin-left:8px;">연결됨</span>'
+        if _llm_avail else
+        '<span style="display:inline-flex;align-items:center;gap:4px;font-size:10px;'
+        'background:#FEE2E2;color:#991B1B;border:1px solid #FCA5A5;'
+        'border-radius:4px;padding:1px 7px;font-weight:600;margin-left:8px;">미연결</span>'
+    )
+    st.markdown(
+        f'<div style="background:#FFFFFF;border:1px solid #E2E8F0;border-radius:12px;'
+        f'box-shadow:0 2px 8px rgba(30,64,175,0.06);margin-bottom:8px;overflow:hidden;">'
+        f'<div style="background:linear-gradient(135deg,#1E3A8A 0%,#1E40AF 50%,#2563EB 100%);'
+        f'padding:10px 18px;display:flex;align-items:center;gap:10px;">'
+        f'<div style="width:28px;height:28px;background:rgba(255,255,255,0.15);'
+        f'border-radius:7px;display:flex;align-items:center;justify-content:center;'
+        f'font-size:16px;flex-shrink:0;">🤖</div>'
+        f'<div style="flex:1;">'
+        f'<div style="font-size:13px;font-weight:700;color:#FFFFFF;letter-spacing:-0.01em;">AI 병동 분석 채팅{_ai_badge}</div>'
+        f'<div style="font-size:10px;color:rgba(255,255,255,0.7);margin-top:1px;">'
+        f'금일 병동 데이터 기반 실시간 분석 · 위험도 평가 · 운영 조언</div>'
+        f'</div></div>'
+        f'<div style="padding:12px 16px;">',
+        unsafe_allow_html=True,
+    )
+    _render_ward_llm_chat(kpi=_kpi_for_llm, bed_occ=[], bed_detail=bed_detail_f, op_stat=op_stat_f)
+    st.markdown("</div></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
     # ════════════════════════════════════════════════════════════
     # ── Row 1: KPI 2행×3열 | 주간 추이 ─────────────────────────
     st.markdown('<div class="wd-row-kpi">', unsafe_allow_html=True)
@@ -2393,41 +2428,7 @@ def _render_ward() -> None:
         )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
-    # ── AI 채팅 카드: 구분선 강조 + 상태 표시 ─────────────────────
-    _llm_avail = True
-    try:
-        from core.llm import get_llm_client as _gc; _gc()
-    except Exception:
-        _llm_avail = False
-    _ai_badge = (
-        '<span style="display:inline-flex;align-items:center;gap:4px;font-size:10px;'
-        'background:#DCFCE7;color:#15803D;border:1px solid #86EFAC;'
-        'border-radius:4px;padding:1px 7px;font-weight:600;margin-left:8px;">연결됨</span>'
-        if _llm_avail else
-        '<span style="display:inline-flex;align-items:center;gap:4px;font-size:10px;'
-        'background:#FEE2E2;color:#991B1B;border:1px solid #FCA5A5;'
-        'border-radius:4px;padding:1px 7px;font-weight:600;margin-left:8px;">미연결</span>'
-    )
-    st.markdown(
-        f'<div style="background:#FFFFFF;border:1px solid #E2E8F0;border-radius:12px;'
-        f'box-shadow:0 2px 8px rgba(30,64,175,0.06);margin-top:8px;overflow:hidden;">'
-        f'<div style="background:linear-gradient(135deg,#1E3A8A 0%,#1E40AF 50%,#2563EB 100%);'
-        f'padding:12px 18px;display:flex;align-items:center;gap:10px;">'
-        f'<div style="width:32px;height:32px;background:rgba(255,255,255,0.15);'
-        f'border-radius:8px;display:flex;align-items:center;justify-content:center;'
-        f'font-size:18px;flex-shrink:0;">🤖</div>'
-        f'<div style="flex:1;">'
-        f'<div style="font-size:14px;font-weight:700;color:#FFFFFF;letter-spacing:-0.01em;">AI 병동 분석 채팅{_ai_badge}</div>'
-        f'<div style="font-size:11px;color:rgba(255,255,255,0.7);margin-top:1px;">'
-        f'금일 병동 운영 데이터를 기반으로 실시간 분석 · 위험도 평가 · 운영 조언 제공</div>'
-        f'</div></div>'
-        f'<div style="padding:14px 16px;">',
-        unsafe_allow_html=True,
-    )
-    _render_ward_llm_chat(kpi=_kpi_for_llm, bed_occ=[], bed_detail=bed_detail_f, op_stat=op_stat_f)
-    st.markdown("</div></div>", unsafe_allow_html=True)
 
 
 
@@ -2807,16 +2808,8 @@ def render_hospital_dashboard(tab: str = "ward") -> None:
     with _c_btns:
         _b1, _b2, _b3 = st.columns(3, gap="small")
         with _b1:
-            # 새로고침 쿨다운 30초 — 동시 접속자 다수가 동시에 누르면 Oracle 쿼리 폭발
-            _last_ref = st.session_state.get(f"last_refresh_ts_{tab}", 0)
-            _elapsed  = int(time.time() - _last_ref)
-            _cd_left  = max(0, 30 - _elapsed)
-            _ref_lbl  = "🔄 새로고침" if _cd_left == 0 else f"⏳ {_cd_left}초"
-            if st.button(_ref_lbl, key=f"dash_refresh_{tab}", use_container_width=True,
-                         type="secondary", disabled=(_cd_left > 0),
-                         help="최신 데이터 재조회 · 30초 쿨다운"):
-                _ref_ts = time.time()
-                st.session_state[f"last_refresh_ts_{tab}"] = _ref_ts
+            if st.button("🔄 새로고침", key=f"dash_refresh_{tab}", use_container_width=True,
+                         type="secondary", help="최신 데이터 재조회"):
                 # Oracle 체크 만료 → 다음 렌더 시 재체크
                 st.session_state.pop("oracle_ok", None)
                 st.session_state.pop("oracle_ok_expire", None)

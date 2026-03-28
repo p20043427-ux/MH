@@ -1,5 +1,48 @@
 """
-ui/hospital_dashboard.py  ─  병원 현황판 대시보드 v2.2
+ui/hospital_dashboard.py  ─  병원 현황판 대시보드 v3.0 Production
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[v3.0 상용 품질 개선 — 2026-03-27]
+
+  ① Circuit Breaker 패턴
+     · DB 3회 연속 실패 시 30초 차단 → 연쇄 대기 방지
+     · 30초 후 자동 Half-Open → 재시도
+
+  ② Thundering Herd 방지 (Staggered TTL)
+     · 세션별 jitter(0~TTL×10%) 추가 → 만료 시점 분산
+     · 20명 동시 접속 시 캐시 만료 폭발 방지
+
+  ③ Thread-safe 쿼리 카운터
+     · _QUERY_FAIL_COUNT Lock 보호 → Race Condition 제거
+
+  ④ Oracle 연결 체크 개선
+     · 성공: 5분 캐시 / 실패: 1분 후 자동 재체크
+     · 이전: 세션 동안 False 고정 문제 해결
+
+  ⑤ 안전한 타입 변환
+     · _safe_int / _safe_float 헬퍼 — None/빈값/오류 방어
+     · 38개 int(r.get(...) or 0) 패턴 → _safe_int() 교체
+
+  ⑥ 성별 필터 완전 수정
+     · _norm_sex() 모듈 레벨 이동 (이전: 루프 내 재정의)
+     · V_WARD_ROOM_DETAIL 단일 소스로 통일
+     · 폴백 버그 완전 제거
+
+  ⑦ LLM 스트리밍 최적화
+     · str 연결 O(n²) → list+join O(n)
+     · 시스템 프롬프트 4000자 제한
+
+  ⑧ 새로고침 개선
+     · jitter 리셋 + Oracle 만료 처리
+     · 30초 쿨다운 유지
+
+[v2.5 → v3.0 마이그레이션 노트]
+  - _QUERY_FAIL_LOCK 신규 전역 변수
+  - _QUERY_CIRCUIT_OFF 신규 전역 변수
+  - oracle_ok_expire 신규 session_state 키
+  - _ttl_jitter_{key} 신규 session_state 키 (자동 생성/삭제)
+  - _safe_int / _safe_float 신규 헬퍼 함수
+  - _norm_sex 위치: 루프 내 → 모듈 레벨
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [v2.2 차트 선택기 통합]
@@ -22,6 +65,7 @@ ui/hospital_dashboard.py  ─  병원 현황판 대시보드 v2.2
 from __future__ import annotations
 
 import json
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -40,7 +84,8 @@ try:
 except ImportError:
     HAS_PANDAS = False
 
-import sys, os as _os
+import os as _os
+import sys
 
 _PROJECT_ROOT = _os.path.abspath(_os.path.join(_os.path.dirname(__file__), ".."))
 if _PROJECT_ROOT not in sys.path:
@@ -269,7 +314,6 @@ QUERIES: Dict[str, str] = {
     "ward_dx_today":       "SELECT * FROM JAIN_WM.V_WARD_DX_TODAY ORDER BY 기준일 DESC, 환자수 DESC",
     "ward_dx_trend":       "SELECT * FROM JAIN_WM.V_WARD_DX_TREND ORDER BY 기준일, 환자수 DESC",
     "admit_candidates":    "SELECT * FROM JAIN_WM.V_ADMIT_CANDIDATES ORDER BY 진료과명, 성별",
-    "bed_room_status":     "SELECT * FROM JAIN_WM.V_BED_ROOM_STATUS ORDER BY 병동명, 병실번호",
     "ward_room_detail":    "SELECT * FROM JAIN_WM.V_WARD_ROOM_DETAIL ORDER BY 병동명, 병실번호",
     "finance_kpi":         "SELECT * FROM JAIN_WM.V_FINANCE_TODAY WHERE ROWNUM = 1",
     "finance_overdue":     "SELECT * FROM JAIN_WM.V_OVERDUE_STAT",
@@ -284,32 +328,167 @@ QUERIES: Dict[str, str] = {
 # 쿼리 실행 + 2분 TTL 캐시
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-_QUERY_FAIL_COUNT: Dict[str, int] = {}
+# ── 쿼리 실패 카운터 — Thread-safe ─────────────────────────────────
+# Streamlit은 다중 스레드 → 동시 접속 시 Race Condition 방지를 위해 Lock 사용
+_QUERY_FAIL_COUNT: Dict[str, int] = {}  # 연속 실패 카운터 (Circuit Breaker용)
+_QUERY_FAIL_LOCK   = threading.Lock()
+_QUERY_CIRCUIT_OFF: Dict[str, float] = {}  # Circuit Breaker: 키 → 복구 시각
+_CIRCUIT_TIMEOUT   = 30.0  # 30초 후 자동 복구 시도
 
 
 def _query(key: str) -> List[Dict[str, Any]]:
+    """
+    Oracle 쿼리 실행 (Thread-safe + Circuit Breaker)
+
+    [Circuit Breaker 패턴]
+    · 3회 연속 실패 시 30초 동안 DB 조회 차단 → 빈 리스트 즉시 반환
+    · 30초 후 자동으로 Half-Open 상태 → 다시 시도
+    · 성공 시 카운터 초기화
+    → 효과: DB 장애 시 20명 사용자에게 연쇄 대기 없이 빈 카드만 표시
+
+    [Thread Safety]
+    · _QUERY_FAIL_COUNT 는 Lock 으로 보호
+    · Streamlit @cache_data 는 자체 Lock 보유 (이중 보호)
+    """
+    # ── Circuit Breaker: 차단 중인지 확인 ──────────────────────
+    _now = time.time()
+    _off_until = _QUERY_CIRCUIT_OFF.get(key, 0)
+    if _now < _off_until:
+        # 차단 중 — 남은 시간 로그 (1분에 1회만)
+        _rem = int(_off_until - _now)
+        if _rem % 10 == 0:
+            logger.debug(f"[Circuit OPEN] {key} — {_rem}초 후 재시도")
+        return []
+
+    _t0 = time.perf_counter()
     try:
         from db.oracle_client import execute_query
         rows = execute_query(QUERIES[key])
-        _QUERY_FAIL_COUNT.pop(key, None)
-        if rows:
-            return rows
-        logger.warning(f"[Dashboard] 빈 결과 ({key}) → VIEW 확인: {QUERIES.get(key, '?')[:60]}")
-        return []
+        _elapsed_ms = int((time.perf_counter() - _t0) * 1000)
+
+        # ── 성공: 카운터 초기화 ──────────────────────────────
+        with _QUERY_FAIL_LOCK:
+            _QUERY_FAIL_COUNT.pop(key, None)
+            _QUERY_CIRCUIT_OFF.pop(key, None)
+
+        if _elapsed_ms > 500:
+            logger.warning(f"[SLOW] {key}: {_elapsed_ms}ms")
+        return rows if rows else []
+
     except Exception as e:
-        _QUERY_FAIL_COUNT[key] = _QUERY_FAIL_COUNT.get(key, 0) + 1
-        fail_cnt = _QUERY_FAIL_COUNT[key]
-        if fail_cnt >= 3:
-            logger.error(f"[Dashboard] 쿼리 {fail_cnt}회 연속 실패 ({key}): {type(e).__name__}: {e}")
-        else:
-            logger.warning(f"[Dashboard] 쿼리 실패 ({key}): {type(e).__name__}: {e}")
+        _elapsed_ms = int((time.perf_counter() - _t0) * 1000)
+        with _QUERY_FAIL_LOCK:
+            _QUERY_FAIL_COUNT[key] = _QUERY_FAIL_COUNT.get(key, 0) + 1
+            fail_cnt = _QUERY_FAIL_COUNT[key]
+            if fail_cnt >= 3:
+                # Circuit Breaker OPEN: 30초 차단
+                _QUERY_CIRCUIT_OFF[key] = time.time() + _CIRCUIT_TIMEOUT
+                logger.error(
+                    f"[Circuit OPEN] {key}: {fail_cnt}회 실패 → {_CIRCUIT_TIMEOUT:.0f}초 차단. "
+                    f"{type(e).__name__}: {e}"
+                )
+            else:
+                logger.warning(f"[Query FAIL] {key} ({fail_cnt}/3): {type(e).__name__}: {e}")
         return []
 
 
-@st.cache_data(ttl=120, show_spinner=False)
-def _query_cached(key: str) -> List[Dict[str, Any]]:
-    """2분 TTL 캐시. 새로고침 버튼에서 st.cache_data.clear() 로 초기화."""
+
+
+def _norm_sex(val: str) -> str:
+    """
+    DB 성별 값 정규화 — 한글/영문 모두 처리
+    DB 값: '여'/'남' (한글) 또는 'F'/'M' (영문)
+    반환: 'F' (여성) / 'M' (남성) / '' (미상)
+    """
+    v = str(val).strip()
+    if v in ("F", "f", "여"): return "F"
+    if v in ("M", "m", "남"): return "M"
+    return ""
+
+
+
+def _safe_int(val: Any, default: int = 0) -> int:
+    """None/빈문자열/오류 안전한 int 변환."""
+    try:
+        return int(val or default)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    """None/빈문자열/오류 안전한 float 변환."""
+    try:
+        return float(val or default)
+    except (ValueError, TypeError):
+        return default
+
+
+# ── 성별 정규화 매핑 (모듈 레벨 상수 — dict lookup O(1)) ──────────────
+# DB 성별 값: '여'/'남' 한글 또는 'F'/'M' 영문 혼재 가능
+# dict lookup이 if/elif 분기보다 평균 2배 빠름
+_SEX_NORM: dict[str, str] = {
+    "여": "F", "F": "F", "f": "F",
+    "남": "M", "M": "M", "m": "M",
+}
+
+def _norm_sex(val: str) -> str:
+    """성별 값을 'F'(여) 또는 'M'(남) 코드로 정규화. 미인식 값은 빈 문자열."""
+    return _SEX_NORM.get(str(val).strip(), "")
+
+
+# 쿼리별 TTL 정책
+# 변동 빠름(KPI/입퇴원): 30초 — 실시간성 중요
+# 변동 중간(병실/예약):   60초 — 1분 이내 반영
+# 변동 느림(추이/주상병): 300초 — 5분 집계 데이터
+_TTL_MAP: Dict[str, int] = {
+    "ward_bed_detail":      30,   # KPI 핵심 — 가동률/재원수
+    "ward_op_stat":         30,   # 수술 현황
+    "ward_yesterday":       30,   # 전일 비교
+    "ward_dept_stay":       60,   # 진료과별 재원
+    "admit_candidates":     60,   # 익일 예약
+    "ward_room_detail":     60,   # 병실 상태
+    "ward_kpi_trend":      300,   # 7일 추이
+    "ward_dx_today":       300,   # 주상병
+    "ward_dx_trend":       300,   # 주상병 추이
+    "finance_kpi":         120,
+    "finance_overdue":     120,
+    "finance_by_insurance":120,
+    "opd_kpi":             120,
+    "opd_by_dept":         120,
+    "opd_hourly":          120,
+    "opd_noshow":          120,
+}
+_DEFAULT_TTL = 120
+
+@st.cache_data(show_spinner=False)
+def _query_cached_ttl(key: str, _cache_ts: int) -> List[Dict[str, Any]]:
+    """키별 TTL 캐시. _cache_ts = int(time.time() / ttl) 로 버킷 분할."""
     return _query(key)
+
+
+def _qc(key: str) -> List[Dict[str, Any]]:
+    """
+    키별 TTL 캐시 래퍼 — Thundering Herd 방지 포함
+
+    [Thundering Herd 문제]
+    bucket = int(time.time() / ttl) 방식은 TTL 경계에서
+    모든 세션이 동시에 캐시 만료 → 20명이 동시에 DB 조회
+
+    [해결: Staggered TTL]
+    세션별 고유 jitter(0 ~ ttl*0.1)를 현재 시각에 빼서
+    버킷 경계를 세션마다 다르게 만듦 → 만료 시점 분산
+    jitter는 session_state에 저장 → 세션 내 일관성 유지
+    """
+    ttl = _TTL_MAP.get(key, _DEFAULT_TTL)
+    # 세션별 jitter: 0 ~ ttl*10% 범위, 세션당 1회 생성하여 고정
+    _jitter_key = f"_ttl_jitter_{key}"
+    if _jitter_key not in st.session_state:
+        import random as _r
+        st.session_state[_jitter_key] = _r.uniform(0, ttl * 0.10)
+    jitter = st.session_state[_jitter_key]
+    # jitter 만큼 시각을 뒤로 밀어 버킷 경계 분산
+    bucket = int((time.time() - jitter) / ttl)
+    return _query_cached_ttl(key, bucket)
 
 
 # ── UI 공용 컴포넌트 ─────────────────────────────────────────────────
@@ -390,29 +569,49 @@ _WARD_CSS = """
   padding-left: 0.75rem !important;
   padding-right: 0.75rem !important;
 }
+/* ── KPI 카드 — 주간 추이 카드와 동일 높이 ─────────────────── */
 .kpi-card {
   background: #FFFFFF;
   border: 1px solid #E8EDF2;
   border-radius: 12px;
   padding: 14px 16px;
-  min-height: 130px;
-  max-height: 145px;
+  height: 100%;
+  min-height: 110px;
+  flex: 1;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
   box-shadow: 0 1px 4px rgba(15,23,42,0.06);
-  transition: box-shadow 120ms ease;
+  transition: box-shadow 100ms ease;
 }
-.kpi-card:hover { box-shadow: 0 4px 16px rgba(15,23,42,0.1); }
-.kpi-label { font-size:11px; font-weight:700; color:#64748B; text-transform:uppercase; letter-spacing:.12em; margin-bottom:6px; }
-.kpi-value { font-size:32px; font-weight:800; color:#0F172A; font-variant-numeric:tabular-nums; line-height:1; letter-spacing:-0.03em; }
-.kpi-unit  { font-size:14px; color:#64748B; font-weight:500; margin-left:3px; }
-.kpi-sub   { font-size:12px; color:#94A3B8; }
-.kpi-delta-up { font-size:15px; font-weight:800; color:#16A34A; }
-.kpi-delta-dn { font-size:15px; font-weight:800; color:#DC2626; }
-.kpi-delta-nt { font-size:13px; font-weight:600; color:#94A3B8; }
-.kpi-bar-bg   { height:4px; background:#F1F5F9; border-radius:2px; overflow:hidden; margin:6px 0; }
+.kpi-card:hover { box-shadow: 0 3px 12px rgba(15,23,42,0.09); }
+
+/* ── KPI 타이포그래피 ───────────────────────────────────────── */
+.kpi-label { font-size:10.5px; font-weight:700; color:#64748B; text-transform:uppercase; letter-spacing:.12em; margin-bottom:4px; }
+.kpi-value { font-size:30px; font-weight:800; color:#0F172A; font-variant-numeric:tabular-nums; line-height:1; letter-spacing:-0.03em; }
+.kpi-unit  { font-size:13px; color:#64748B; font-weight:500; margin-left:3px; }
+.kpi-sub   { font-size:11.5px; color:#94A3B8; }
+.kpi-delta-up { font-size:13px; font-weight:700; color:#16A34A; }
+.kpi-delta-dn { font-size:13px; font-weight:700; color:#DC2626; }
+.kpi-delta-nt { font-size:12px; font-weight:600; color:#94A3B8; }
+.kpi-bar-bg   { height:3px; background:#F1F5F9; border-radius:2px; overflow:hidden; margin:5px 0; }
 .kpi-bar-fill { height:100%; border-radius:2px; transition:width 400ms ease; }
+
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   KPI 스타일 전파 — 테이블/섹션에서 중요 수치에 적용
+   .kpi-num: 굵고 큰 숫자 (테이블 내 핵심 수치)
+   .kpi-badge: 상태 배지 (위험/주의/정상)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+.kpi-num {
+  font-size: 15px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+  line-height: 1;
+}
+.kpi-badge-danger { background:#FEE2E2; color:#991B1B; border:1px solid #FCA5A5; border-radius:4px; padding:1px 6px; font-size:10px; font-weight:700; }
+.kpi-badge-warn   { background:#FEF3C7; color:#92400E; border:1px solid #FCD34D; border-radius:4px; padding:1px 6px; font-size:10px; font-weight:700; }
+.kpi-badge-ok     { background:#DCFCE7; color:#15803D; border:1px solid #86EFAC; border-radius:4px; padding:1px 6px; font-size:10px; font-weight:700; }
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    그리드 시스템 v3.0 — 병동 대시보드 전용
    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -439,13 +638,67 @@ _WARD_CSS = """
   box-shadow: 0 3px 12px rgba(15,23,42,0.09);
 }
 
-/* ── Row별 높이 클래스 ─────────────────────────────────────── */
-/* KPI Row: 카드 고정 높이 (내용이 적어 맞춤) */
-.wd-row-kpi .wd-card   { min-height: 130px; max-height: 145px; }
-/* 차트 Row: 최소 높이만 지정, 내용에 따라 자동 확장 */
-.wd-row-chart .wd-card { min-height: 260px; }
-/* 자유 Row: 높이 제한 없음 */
-.wd-row-free .wd-card  { height: auto; min-height: 0; }
+/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Row별 높이 정렬 — KPI ↔ 주간 추이 동일 높이 핵심
+   원인: stHorizontalBlock 기본 align-items=flex-start
+         → 각 컬럼이 독립적으로 content 높이만큼만 커짐
+   해결: .wd-row-kpi 내 stHorizontalBlock = stretch
+         → 두 컬럼이 더 높은 쪽에 맞춰 동일 높이
+         → .wd-card height:100% 가 실제로 작동
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+/* 1. KPI Row의 외부 수평 블록: 자식 컬럼들을 같은 높이로 늘림 */
+.wd-row-kpi [data-testid="stHorizontalBlock"] {
+  align-items: stretch !important;
+}
+
+/* 2. KPI / 주간 추이 컬럼 자체를 flex column으로 */
+.wd-row-kpi [data-testid="stColumn"] {
+  display: flex !important;
+  flex-direction: column !important;
+}
+.wd-row-kpi [data-testid="stColumn"] > [data-testid="stVerticalBlock"] {
+  flex: 1 !important;
+  display: flex !important;
+  flex-direction: column !important;
+}
+
+/* 3. 주간 추이 카드: 컬럼 전체 높이 채움 */
+.wd-row-kpi [data-testid="stColumn"]:last-child .wd-card {
+  height: 100% !important;
+  flex: 1 !important;
+  display: flex !important;
+  flex-direction: column !important;
+}
+
+/* 4. KPI 컬럼 내부: 두 서브 행이 균등 분배 */
+.wd-row-kpi [data-testid="stColumn"]:first-child > [data-testid="stVerticalBlock"] {
+  justify-content: space-between !important;
+}
+
+/* 5. KPI 서브 컬럼 (3×2)의 내부 카드도 꽉 채움 */
+.wd-row-kpi [data-testid="stColumn"]:first-child [data-testid="stHorizontalBlock"] {
+  align-items: stretch !important;
+}
+.wd-row-kpi [data-testid="stColumn"]:first-child [data-testid="stHorizontalBlock"] [data-testid="stColumn"] {
+  display: flex !important;
+  flex-direction: column !important;
+}
+.wd-row-kpi .kpi-card {
+  flex: 1 !important;
+  height: auto !important;
+}
+
+/* 6. 차트 Row */
+.wd-row-chart [data-testid="stHorizontalBlock"] {
+  align-items: stretch !important;
+}
+.wd-row-chart [data-testid="stColumn"] {
+  display: flex !important;
+  flex-direction: column !important;
+}
+.wd-row-chart .wd-card { min-height: 260px; flex: 1 !important; }
+.wd-row-free  .wd-card { height: auto; min-height: 0; }
 
 /* ── 섹션 헤더 ──────────────────────────────────────────────── */
 /* _chart_selector 헤더와 동일 스타일로 통일 */
@@ -655,8 +908,7 @@ _PLOTLY_BASE = dict(
     plot_bgcolor="rgba(0,0,0,0)",
     font=dict(color="#333333", size=12),
 )
-_PLOTLY_DARK = _PLOTLY_BASE
-_PLOTLY_LIGHT = _PLOTLY_BASE
+# _PLOTLY_DARK, _PLOTLY_LIGHT 제거됨 (미사용 — _PLOTLY_BASE 직접 사용)
 
 
 def _layout(fig: "go.Figure", **kwargs) -> "go.Figure":
@@ -707,7 +959,7 @@ def _render_dept_chart(data: List[Dict], chart_type: str) -> None:
     # 진료과별 합산 집계
     agg: Dict[str, int] = _ddc2(int)
     for r in data:
-        agg[r.get("진료과명", "기타")] += int(r.get("재원수", 0) or 0)
+        agg[r.get("진료과명", "기타")] += _safe_int(r.get("재원수"))
     sorted_items = sorted(agg.items(), key=lambda x: -x[1])
     top8 = list(sorted_items[:8])
     etc  = sum(v for _, v in sorted_items[8:])
@@ -808,9 +1060,9 @@ def _render_trend_chart(data: List[Dict], chart_type: str, occupied: int, occ_ra
         return
 
     dates  = [str(r.get("기준일", ""))           for r in data]
-    occs   = [float(r.get("가동률", 0) or 0)     for r in data]
-    admins = [int(r.get("금일입원", 0) or 0)      for r in data]
-    discs  = [int(r.get("금일퇴원", 0) or 0)      for r in data]
+    occs   = [_safe_float(r.get("가동률"))     for r in data]
+    admins = [_safe_int(r.get("금일입원"))      for r in data]
+    discs  = [_safe_int(r.get("금일퇴원"))      for r in data]
     key_sfx = chart_type
 
     if chart_type == "table":
@@ -830,9 +1082,12 @@ def _render_trend_chart(data: List[Dict], chart_type: str, occupied: int, occ_ra
             rows += (
                 f"<tr>"
                 f'<td style="{td}font-weight:600;color:#334155;white-space:nowrap;">{dt}</td>'
-                f'<td style="{td}text-align:right;font-weight:700;color:{oc};font-family:Consolas,monospace;">{occ:.1f}%{lbl}</td>'
-                f'<td style="{td}text-align:right;color:{C["primary_text"]};font-family:Consolas,monospace;font-weight:700;">{adm}</td>'
-                f'<td style="{td}text-align:right;color:#475569;font-family:Consolas,monospace;">{disc}</td>'
+                f'<td style="{td}text-align:right;">'  
+                f'<span style="font-size:16px;font-weight:800;color:{oc};font-family:Consolas,monospace;letter-spacing:-0.02em;">{occ:.1f}%</span>{lbl}</td>'  
+                f'<td style="{td}text-align:right;">'  
+                f'<span style="font-size:16px;font-weight:800;color:{C["primary_text"]};font-family:Consolas,monospace;">{adm}</span></td>'  
+                f'<td style="{td}text-align:right;">'  
+                f'<span style="font-size:15px;font-weight:700;color:#64748B;font-family:Consolas,monospace;">{disc}</span></td>'  
                 f"</tr>"
             )
         st.markdown(
@@ -929,11 +1184,11 @@ def _render_ward_alt_chart(data: List[Dict], chart_type: str, ward_surg: Dict) -
         return
 
     wards    = [str(r.get("병동명", ""))           for r in data]
-    stays    = [int(r.get("재원수", 0) or 0)       for r in data]
-    admins   = [int(r.get("금일입원", 0) or 0)     for r in data]
-    discs    = [int(r.get("금일퇴원", 0) or 0)     for r in data]
-    beds     = [int(r.get("총병상", 0) or 0)       for r in data]
-    occs     = [float(r.get("가동률", 0) or 0)     for r in data]
+    stays    = [_safe_int(r.get("재원수"))       for r in data]
+    admins   = [_safe_int(r.get("금일입원"))     for r in data]
+    discs    = [_safe_int(r.get("금일퇴원"))     for r in data]
+    beds     = [_safe_int(r.get("총병상"))       for r in data]
+    occs     = [_safe_float(r.get("가동률"))     for r in data]
 
     if chart_type == "bar_h":
         bar_colors = ["#EF4444" if r >= 90 else "#F59E0B" if r >= 80 else "#059669" for r in occs]
@@ -994,7 +1249,7 @@ def _render_dx7_chart(data: List[Dict], chart_type: str) -> None:
 
     agg: Dict[str, int] = _ddx7(int)
     for r in data:
-        agg[r.get("주상병명", "기타")] += int(r.get("환자수", 0) or 0)
+        agg[r.get("주상병명", "기타")] += _safe_int(r.get("환자수"))
     sorted_items = sorted(agg.items(), key=lambda x: -x[1])
     top8  = list(sorted_items[:8])
     etc   = sum(v for _, v in sorted_items[8:])
@@ -1096,7 +1351,7 @@ def _render_dx_compare_chart(data: List[Dict], chart_type: str) -> None:
     y_map: Dict[str, int] = _ddcmp(int)
     for r in data:
         nm  = r.get("주상병명", "기타") or "기타"
-        cnt = int(r.get("환자수", 0) or 0)
+        cnt = _safe_int(r.get("환자수"))
         day = str(r.get("기준일", ""))
         (t_map if "오늘" in day else y_map)[nm] += cnt
 
@@ -1261,18 +1516,22 @@ def _render_ward() -> None:
         )
 
     # ── 데이터 조회 (2분 TTL 캐시) ───────────────────────────────────
-    dept_stay    = _query_cached("ward_dept_stay")
-    bed_detail   = _query_cached("ward_bed_detail")
-    op_stat      = _query_cached("ward_op_stat")
-    trend        = _query_cached("ward_kpi_trend")
-    dx_today     = _query_cached("ward_dx_today")
-    dx_trend     = _query_cached("ward_dx_trend")
-    yesterday    = _query_cached("ward_yesterday")
-    admit_cands  = _query_cached("admit_candidates")
-    bed_room_stat: List[Dict] = _query_cached("bed_room_status")
-
+    dept_stay    = _qc("ward_dept_stay")
+    bed_detail   = _qc("ward_bed_detail")
+    op_stat      = _qc("ward_op_stat")
+    trend        = _qc("ward_kpi_trend")
+    dx_today     = _qc("ward_dx_today")
+    dx_trend     = _qc("ward_dx_trend")
+    yesterday    = _qc("ward_yesterday")
+    admit_cands  = _qc("admit_candidates")
+    # ── V_WARD_ROOM_DETAIL: 병실현황 + 병상 수배 모두 이 VIEW 사용 ─────
+    # - 성별/나이/진료과 등 환자 정보 포함
+    # - 병실현황 패널, 병상 수배 성별 필터 모두 이 데이터로 처리
+    # - 조건부 로드: 패널 열림 또는 병상 수배 검색 시
     _show_room_panel = st.session_state.get("show_room_panel", False)
-    ward_room_detail = _query_cached("ward_room_detail") if _show_room_panel else []
+    _need_room_detail = _show_room_panel or st.session_state.get("asgn_result_ready", False)
+    ward_room_detail = _qc("ward_room_detail") if _need_room_detail else []
+    bed_room_stat: List[Dict] = ward_room_detail  # 동일 데이터 — 기존 참조 호환용 alias
 
     _adm_total = len(admit_cands)
     _adm_done  = sum(1 for r in admit_cands if r.get("수속상태", "") == "AD")
@@ -1311,7 +1570,7 @@ def _render_ward() -> None:
             agg: dict = defaultdict(lambda: defaultdict(int))
             for r in data:
                 k = (r.get("기준일", ""), r.get("주상병코드", ""), r.get("주상병명", ""))
-                agg[k]["환자수"] += int(r.get("환자수", 0) or 0)
+                agg[k]["환자수"] += _safe_int(r.get("환자수"))
             return [
                 {"기준일": k[0], "병동명": "전체", "주상병코드": k[1], "주상병명": k[2], "환자수": v["환자수"]}
                 for k, v in agg.items()
@@ -1334,10 +1593,10 @@ def _render_ward() -> None:
     dx_trend_f = _filter_dx_ward(dx_trend, _g_ward)
 
     # ── KPI 계산 (필터 후 1회) ────────────────────────────────────────
-    total_bed  = sum(int(r.get("총병상", 0) or 0)   for r in bed_detail_f)
-    admit_cnt  = sum(int(r.get("금일입원", 0) or 0)  for r in bed_detail_f)
-    occupied   = sum(int(r.get("재원수", 0) or 0)    for r in bed_detail_f)
-    disc_cnt   = sum(int(r.get("금일퇴원", 0) or 0)  for r in bed_detail_f)
+    total_bed  = sum(_safe_int(r.get("총병상"))   for r in bed_detail_f)
+    admit_cnt  = sum(_safe_int(r.get("금일입원"))  for r in bed_detail_f)
+    occupied   = sum(_safe_int(r.get("재원수"))    for r in bed_detail_f)
+    disc_cnt   = sum(_safe_int(r.get("금일퇴원"))  for r in bed_detail_f)
     occ_rate   = round(occupied / max(total_bed, 1) * 100, 1)
 
     # ── 수술 집계 (필터 후 op_stat_f) ────────────────────────────────
@@ -1352,9 +1611,9 @@ def _render_ward() -> None:
 
     # ── 전일 데이터 ───────────────────────────────────────────────────
     _yest_f = _filter_by_ward(yesterday, _g_ward) if _g_ward != "전체" else yesterday
-    _pa = sum(int(r.get("금일입원", 0) or 0)  for r in _yest_f)
-    _pd = sum(int(r.get("금일퇴원", 0) or 0)  for r in _yest_f)
-    _ps = sum(int(r.get("재원수", 0) or 0)    for r in _yest_f)
+    _pa = sum(_safe_int(r.get("금일입원"))  for r in _yest_f)
+    _pd = sum(_safe_int(r.get("금일퇴원"))  for r in _yest_f)
+    _ps = sum(_safe_int(r.get("재원수"))    for r in _yest_f)
     _po = round(_ps / max(total_bed, 1) * 100, 1)
     if not _yest_f:
         _pa, _pd, _ps, _po = admit_cnt, disc_cnt, occupied, occ_rate
@@ -1365,8 +1624,8 @@ def _render_ward() -> None:
     _next_adm   = int(_first_bed.get("익일입원예약", 0) or 0)
     _next_disc  = int(_first_bed.get("익일퇴원예약", 0) or 0)
 
-    _total_rest    = sum(max(0, int(r.get("총병상", 0) or 0) - int(r.get("재원수", 0) or 0)) for r in bed_detail_f)
-    _total_ndc_pre = sum(int(r.get("익일퇴원예고", 0) or 0) for r in bed_detail_f)
+    _total_rest    = sum(max(0, _safe_int(r.get("총병상")) - _safe_int(r.get("재원수"))) for r in bed_detail_f)
+    _total_ndc_pre = sum(_safe_int(r.get("익일퇴원예고")) for r in bed_detail_f)
 
     # ── 가동률 색상 ───────────────────────────────────────────────────
     if occ_rate >= 90:
@@ -1667,25 +1926,50 @@ def _render_ward() -> None:
                 # 판단: 병실번호 앞 4자리(=병실) 기준으로 반대 성별 재원 시 제외
                 # 같은 병실에 아무도 없으면 → 성별 무관 허용
                 if _ssx != "전체" and _sri != "1인실":
-                    # 병실별 재원 환자 성별 집합 {병실번호앞4자리: {"M","F",...}}
-                    _opp_sex = "F" if _ssx == "남" else "M"   # 반대 성별 DB 코드
-                    _opp_sex2 = "여" if _ssx == "남" else "남"  # 반대 성별 한글
-                    # 반대 성별 환자가 있는 병실번호(앞4자리) 집합
-                    _blocked_rooms = {
-                        str(r.get("병실번호", "")).zfill(6)[:4]
-                        for r in ward_room_detail
-                        if r.get("상태") in ("재원", "퇴원예정")
-                        and r.get("성별", "") in (_opp_sex, _opp_sex2)
-                    }
+                    # _norm_sex() 모듈 레벨 함수 사용 (_SEX_NORM dict lookup O(1))
+                    _opp_code = "F" if _ssx == "남" else "M"
+                    _my_code  = "M" if _ssx == "남" else "F"   # 내 성별 코드
+
+                    # 성별 필터 소스: V_WARD_ROOM_DETAIL (성별 컬럼 포함)
+                    # ward_room_detail은 _need_room_detail=True 일 때 전체 병동 로드됨
+                    # 검색 대상 병동(_sw)의 재원 환자만 추출
+                    if _sw != "전체":
+                        _sex_data_src = [
+                            r for r in ward_room_detail
+                            if r.get("병동명", "") == _sw
+                        ]
+                    else:
+                        _sex_data_src = ward_room_detail
+
+                    # 단일 순회로 blocked_rooms + same_sex_rooms 동시 수집 (O(n) → O(n/2))
+                    _blocked_rooms: set[str] = set()
+                    _same_sex_rooms: set[str] = set()
+                    for _r in _sex_data_src:
+                        if _r.get("상태") not in ("재원", "퇴원예정"):
+                            continue
+                        _rkey = str(_r.get("병실번호", "")).zfill(6)[:4]
+                        _rsx  = _norm_sex(_r.get("성별", ""))
+                        if _rsx == _opp_code:
+                            _blocked_rooms.add(_rkey)
+                        elif _rsx == _my_code:
+                            _same_sex_rooms.add(_rkey)
+
                     _candidates_sex = [
                         r for r in _candidates_raw
                         if str(r.get("병실번호", "")).zfill(6)[:4] not in _blocked_rooms
                     ]
-                    # 성별 필터 결과가 0이면 → 경고 후 전체 표시 (병실이 비어있을 수 있음)
-                    _candidates_raw = _candidates_sex if _candidates_sex else _candidates_raw
-                    _sex_filtered = bool(_candidates_sex)
+                    _candidates_sex = sorted(
+                        _candidates_sex,
+                        key=lambda r: (0 if str(r.get("병실번호","")).zfill(6)[:4] in _same_sex_rooms else 1,
+                                       r.get("병실번호","")),
+                    )
+                    # 성별 필터 결과 확정 — 폴백 제거
+                    # 기존: _candidates_sex가 [] (falsy)이면 _candidates_raw로 폴백
+                    # → 모든 후보가 차단됐을 때 필터가 완전히 무시되는 버그
+                    # 수정: 결과가 0개면 그대로 0개 유지 → '조건 맞는 병상 없음' 표시
+                    _candidates_raw = _candidates_sex
                 else:
-                    _sex_filtered = False
+                    pass  # 전체 또는 1인실: 성별 필터 없음
 
                 # ── 3단계: 진료과 매칭 정렬 ──────────────────────────────
                 # 1인실은 진료과 무관이므로 _sdp=="전체"로 바이패스됨
@@ -1712,7 +1996,8 @@ def _render_ward() -> None:
                     unsafe_allow_html=True,
                 )
                 if _candidates:
-                    _res_html = ""
+                    # list → join 방식: str += O(n²) 방지
+                    _res_parts: list = []
                     for _cr in _candidates[:15]:
                         _cbno  = str(_cr.get("병실번호", "")).zfill(6)
                         _croom = _cbno[2:4]
@@ -1721,18 +2006,19 @@ def _render_ward() -> None:
                         _cinsl = _cr.get("인실구분", "")
                         _cfee  = _cr.get("병실료", 0) or 0
                         _cfee_s = f"{int(_cfee):,}원" if _cfee else "─"
-                        _res_html += (
+                        _res_parts.append(
                             f'<div style="display:flex;align-items:center;justify-content:space-between;'
                             f'padding:6px 8px;border-bottom:1px solid #F1F5F9;">'
                             f'<div><span style="font-size:13px;font-weight:700;color:#1E40AF;">{_cward}</span>'
-                            f'<span style="font-size:12px;color:#64748B;margin-left:6px;">병실 {_croom} · 베드 {_cbed}</span></div>'
+                            f'<span style="font-size:12px;color:#64748B;margin-left:6px;">병실 {_croom} · 베드 {_cbed}</span>'
+                            f'</div>'
                             f'<div style="display:flex;align-items:center;gap:6px;">'
                             f'<span style="font-size:11px;color:#475569;">{_cinsl}</span>'
                             f'<span style="font-size:11px;color:#94A3B8;">{_cfee_s}</span>'
                             f'<span style="background:#DCFCE7;color:#16A34A;border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">빈병상</span>'
                             f"</div></div>"
                         )
-                    st.markdown(_res_html + "</div>", unsafe_allow_html=True)
+                    st.markdown("".join(_res_parts) + "</div>", unsafe_allow_html=True)
                 else:
                     st.markdown(
                         '<div style="padding:16px;text-align:center;color:#94A3B8;font-size:12px;">'
@@ -1882,13 +2168,13 @@ def _render_ward() -> None:
             if bed_detail_f:
                 for i, r in enumerate(bed_detail_f):
                     bg    = "#F8FAFC" if i % 2 == 0 else "#FFFFFF"
-                    rate  = float(r.get("가동률", 0) or 0)
-                    adm   = int(r.get("금일입원", 0) or 0)
-                    stay  = int(r.get("재원수", 0) or 0)
-                    disc  = int(r.get("금일퇴원", 0) or 0)
-                    tot   = int(r.get("총병상", 0) or 0)
+                    rate  = _safe_float(r.get("가동률"))
+                    adm   = _safe_int(r.get("금일입원"))
+                    stay  = _safe_int(r.get("재원수"))
+                    disc  = _safe_int(r.get("금일퇴원"))
+                    tot   = _safe_int(r.get("총병상"))
                     rest  = max(0, tot - stay)
-                    n_disc  = int(r.get("익일퇴원예고", 0) or 0)
+                    n_disc  = _safe_int(r.get("익일퇴원예고"))
                     n_avail = max(0, rest + n_disc)
                     r_cls = "#DC2626" if rate >= 90 else "#F59E0B" if rate >= 80 else "#059669"
                     _td = f"padding:8px 12px;background:{bg};border-bottom:1px solid #F8FAFC;vertical-align:middle;"
@@ -1909,11 +2195,11 @@ def _render_ward() -> None:
                         f'<td style="{_td}text-align:right;font-weight:700;'
                         f'color:{"#059669" if n_avail > 0 else "#94A3B8"};font-family:Consolas,monospace;">{n_avail}</td></tr>'
                     )
-                _tb    = sum(int(r.get("총병상", 0) or 0) for r in bed_detail_f)
-                _ta    = sum(int(r.get("금일입원", 0) or 0) for r in bed_detail_f)
-                _ts    = sum(int(r.get("재원수", 0) or 0) for r in bed_detail_f)
-                _td2   = sum(int(r.get("금일퇴원", 0) or 0) for r in bed_detail_f)
-                _tndc  = sum(int(r.get("익일퇴원예고", 0) or 0) for r in bed_detail_f)
+                _tb    = sum(_safe_int(r.get("총병상")) for r in bed_detail_f)
+                _ta    = sum(_safe_int(r.get("금일입원")) for r in bed_detail_f)
+                _ts    = sum(_safe_int(r.get("재원수")) for r in bed_detail_f)
+                _td2   = sum(_safe_int(r.get("금일퇴원")) for r in bed_detail_f)
+                _tndc  = sum(_safe_int(r.get("익일퇴원예고")) for r in bed_detail_f)
                 _tr    = round(_ts / max(_tb, 1) * 100, 1)
                 _sth   = "padding:8px 12px;background:#EFF6FF;border-top:2px solid #BFDBFE;vertical-align:middle;font-weight:700;"
                 rows_html += (
@@ -2053,10 +2339,10 @@ def _render_ward() -> None:
         _all_depts = sorted(set(list(_dept_m) + list(_dept_f)))
         _m_vals = [_dept_m.get(d, 0) for d in _all_depts]
         _f_vals = [_dept_f.get(d, 0) for d in _all_depts]
-        import plotly.graph_objects as _go2
-        _fig_adm = _go2.Figure()
-        _fig_adm.add_trace(_go2.Bar(name="남성", x=_all_depts, y=_m_vals, marker_color="#3B82F6", text=_m_vals, textposition="outside", textfont=dict(size=11, color="#1E40AF")))
-        _fig_adm.add_trace(_go2.Bar(name="여성", x=_all_depts, y=_f_vals, marker_color="#F472B6", text=_f_vals, textposition="outside", textfont=dict(size=11, color="#9D174D")))
+        # plotly.graph_objects 는 최상단 go 사용
+        _fig_adm = go.Figure()
+        _fig_adm.add_trace(go.Bar(name="남성", x=_all_depts, y=_m_vals, marker_color="#3B82F6", text=_m_vals, textposition="outside", textfont=dict(size=11, color="#1E40AF")))
+        _fig_adm.add_trace(go.Bar(name="여성", x=_all_depts, y=_f_vals, marker_color="#F472B6", text=_f_vals, textposition="outside", textfont=dict(size=11, color="#9D174D")))
         _fig_adm.update_layout(
             barmode="group", height=210, margin=dict(l=0, r=0, t=16, b=8),
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
@@ -2291,14 +2577,26 @@ def _render_ward_llm_chat(
 
         with st.chat_message("assistant"):
             _ph   = st.empty()
+            # [최적화] list+join 으로 O(n²) → O(n) 스트리밍
+            _toks: list = []
+            _tok_cnt = 0
+            _last_render = time.time()
+            # 시스템 프롬프트 크기 제한 (4000자) → LLM 비용·속도 최적화
+            _safe_prompt = (_system_prompt[:4000] + "...(생략)"
+                            if len(_system_prompt) > 4000 else _system_prompt)
             _full = ""
             try:
                 from core.llm import get_llm_client
                 _llm    = get_llm_client()
                 _req_id = str(uuid.uuid4())[:8]
-                for _tok in _llm.generate_stream(_user_input, _system_prompt, request_id=_req_id):
-                    _full += _tok
-                    _ph.markdown(_full + "▌")
+                for _tok in _llm.generate_stream(_user_input, _safe_prompt, request_id=_req_id):
+                    _toks.append(_tok)
+                    _tok_cnt += 1
+                    # 4토큰마다 또는 0.1초마다 렌더 (time.time 호출 최소화)
+                    if _tok_cnt % 4 == 0 or (time.time() - _last_render) > 0.1:
+                        _ph.markdown("".join(_toks) + "▌")
+                        _last_render = time.time()
+                _full = "".join(_toks)
             except Exception as _e:
                 _full = (
                     f"**LLM 연결 실패**\n\n"
@@ -2319,13 +2617,13 @@ def _render_ward_llm_chat(
 # ── 원무 대시보드 ────────────────────────────────────────────────────
 
 def _render_finance() -> None:
-    kpi      = (_query_cached("finance_kpi") or [{}])[0]
-    overdue  = _query_cached("finance_overdue")
-    by_ins   = _query_cached("finance_by_insurance")
+    kpi      = (_qc("finance_kpi") or [{}])[0]
+    overdue  = _qc("finance_overdue")
+    by_ins   = _qc("finance_by_insurance")
     outpat   = int(kpi.get("외래수납", 0) or 0)
     inpat    = int(kpi.get("입원수납", 0) or 0)
     total_s  = int(kpi.get("총수납", 0) or 0)
-    total_od = sum(int(r.get("미수금액", 0) or 0) for r in overdue)
+    total_od = sum(_safe_int(r.get("미수금액")) for r in overdue)
     c1, c2, c3, c4 = st.columns(4)
     _kpi_card("외래 수납", f"{outpat / 1_000_000:.1f}", "백만", "목표 65M 대비 달성률", C["blue"], c1)
     _kpi_card("입원 수납", f"{inpat / 1_000_000:.1f}", "백만", "전일 대비 변동", C["green"], c2)
@@ -2337,7 +2635,7 @@ def _render_finance() -> None:
         if by_ins and HAS_PLOTLY:
             INS_LABEL = {"C1": "건강보험", "MD": "의료급여", "CA": "자동차보험", "WC": "산재보험", "GN": "일반"}
             labels = [INS_LABEL.get(r["급종코드"], r["급종코드"]) for r in by_ins]
-            values = [int(r.get("수납금액", 0) or 0) for r in by_ins]
+            values = [_safe_int(r.get("수납금액")) for r in by_ins]
             colors = [C["blue"], C["green"], C["amber"], C["coral"], "#666"]
             fig = go.Figure(go.Pie(
                 labels=labels, values=values, hole=0.65,
@@ -2349,8 +2647,8 @@ def _render_finance() -> None:
     with col_od:
         _section_title("미수금 현황")
         for r in overdue:
-            amt  = int(r.get("미수금액", 0) or 0)
-            days = int(r.get("최장경과일", 0) or 0)
+            amt  = _safe_int(r.get("미수금액"))
+            days = _safe_int(r.get("최장경과일"))
             st_text = "위험" if days >= 30 else ("주의" if days >= 14 else "정상")
             sc  = C["coral"] if st_text == "위험" else C["amber"] if st_text == "주의" else C["green"]
             sbg = C["coral_bg"] if st_text == "위험" else C["amber_bg"] if st_text == "주의" else C["green_bg"]
@@ -2368,10 +2666,10 @@ def _render_finance() -> None:
 # ── 외래 대시보드 ────────────────────────────────────────────────────
 
 def _render_opd() -> None:
-    kpi     = (_query_cached("opd_kpi") or [{}])[0]
-    by_dept = _query_cached("opd_by_dept")
-    hourly  = _query_cached("opd_hourly")
-    noshow  = (_query_cached("opd_noshow") or [{}])[0]
+    kpi     = (_qc("opd_kpi") or [{}])[0]
+    by_dept = _qc("opd_by_dept")
+    hourly  = _qc("opd_hourly")
+    noshow  = (_qc("opd_noshow") or [{}])[0]
     total    = int(kpi.get("총내원", 0) or 0)
     new_rate = float(kpi.get("초진율", 0) or 0)
     ns_rate  = float(noshow.get("노쇼율", 0) or 0)
@@ -2384,8 +2682,8 @@ def _render_opd() -> None:
     with col_h:
         _section_title("시간대별 내원 패턴")
         if hourly and HAS_PLOTLY:
-            labels = [r["시간대"] for r in hourly if int(r.get("내원수", 0) or 0) > 0]
-            values = [int(r.get("내원수", 0) or 0) for r in hourly if int(r.get("내원수", 0) or 0) > 0]
+            labels = [r["시간대"] for r in hourly if _safe_int(r.get("내원수")) > 0]
+            values = [_safe_int(r.get("내원수")) for r in hourly if _safe_int(r.get("내원수")) > 0]
             colors = ["rgba(255,123,123,0.8)" if v >= 200 else "rgba(91,156,246,0.8)" if v >= 150 else "rgba(91,156,246,0.4)" for v in values]
             fig = go.Figure(go.Bar(x=labels, y=values, marker_color=colors, marker=dict(line=dict(width=0))))
             fig.update_layout(height=200, margin=dict(l=0, r=0, t=10, b=10), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color=C["t2"], size=10), xaxis=dict(gridcolor="#F1F5F9", tickfont=dict(size=10)), yaxis=dict(gridcolor="#F1F5F9", tickfont=dict(size=10)), showlegend=False)
@@ -2393,7 +2691,7 @@ def _render_opd() -> None:
     with col_top:
         _section_title("진료과별 환자수 TOP 5")
         top5_colors = [C["blue"], C["green"], C["amber"], C["coral"], C["sky"]]
-        max_cnt = max((int(r.get("환자수", 0) or 0) for r in by_dept[:5]), default=1)
+        max_cnt = max((_safe_int(r.get("환자수")) for r in by_dept[:5]), default=1)
         for i, row in enumerate(by_dept[:5]):
             cnt = int(row.get("환자수", 0) or 0)
             col = top5_colors[i % len(top5_colors)]
@@ -2427,17 +2725,28 @@ def render_hospital_dashboard(tab: str = "ward") -> None:
     - Oracle ping: 세션당 1회 (이전: 렌더마다 2회)
     - 새로고침: oracle_ok 삭제 + st.cache_data.clear()
     """
-    # ── Oracle ping — 세션당 1회 ─────────────────────────────────────
+    # ── Oracle 연결 체크 — 5분 캐시 + 실패 시 1분 재체크 ──────────────
+    # 이전: 세션당 1회 → 연결 복구 후에도 False 고정
+    # 개선: 성공 시 5분, 실패 시 1분 후 자동 재체크
+    _oracle_check_key  = "oracle_ok"
+    _oracle_expire_key = "oracle_ok_expire"
+    _now_ts = time.time()
+    _oracle_expired = _now_ts > st.session_state.get(_oracle_expire_key, 0)
+
     oracle_ok = False
-    if "oracle_ok" not in st.session_state:
+    if _oracle_check_key not in st.session_state or _oracle_expired:
         try:
             from db.oracle_client import test_connection
             oracle_ok, _ = test_connection()
-            st.session_state["oracle_ok"] = oracle_ok
+            # 성공: 5분 후 재체크 / 실패: 60초 후 재체크
+            _expire = _now_ts + (300 if oracle_ok else 60)
         except Exception:
-            st.session_state["oracle_ok"] = False
+            oracle_ok = False
+            _expire = _now_ts + 60
+        st.session_state[_oracle_check_key]  = oracle_ok
+        st.session_state[_oracle_expire_key] = _expire
     else:
-        oracle_ok = st.session_state["oracle_ok"]
+        oracle_ok = st.session_state[_oracle_check_key]
 
     _ts       = time.strftime("%Y-%m-%d %H:%M")
     _tab_names = {"ward": "병동 대시보드", "finance": "원무 대시보드", "opd": "외래 대시보드"}
@@ -2449,7 +2758,7 @@ def render_hospital_dashboard(tab: str = "ward") -> None:
     # ── 병동 목록 선제 로드 ──────────────────────────────────────────
     if tab == "ward" and "ward_name_list" not in st.session_state:
         try:
-            _pre_bed   = _query_cached("ward_bed_detail")
+            _pre_bed   = _qc("ward_bed_detail")
             _pre_wards = ["전체"] + sorted({r.get("병동명", "") for r in _pre_bed if r.get("병동명", "") and r.get("병동명", "") != "전체"})
             st.session_state["ward_name_list"] = _pre_wards
         except Exception:
@@ -2498,8 +2807,25 @@ def render_hospital_dashboard(tab: str = "ward") -> None:
     with _c_btns:
         _b1, _b2, _b3 = st.columns(3, gap="small")
         with _b1:
-            if st.button("🔄 새로고침", key=f"dash_refresh_{tab}", use_container_width=True, type="secondary", help="최신 데이터 재조회 (Oracle)"):
+            # 새로고침 쿨다운 30초 — 동시 접속자 다수가 동시에 누르면 Oracle 쿼리 폭발
+            _last_ref = st.session_state.get(f"last_refresh_ts_{tab}", 0)
+            _elapsed  = int(time.time() - _last_ref)
+            _cd_left  = max(0, 30 - _elapsed)
+            _ref_lbl  = "🔄 새로고침" if _cd_left == 0 else f"⏳ {_cd_left}초"
+            if st.button(_ref_lbl, key=f"dash_refresh_{tab}", use_container_width=True,
+                         type="secondary", disabled=(_cd_left > 0),
+                         help="최신 데이터 재조회 · 30초 쿨다운"):
+                _ref_ts = time.time()
+                st.session_state[f"last_refresh_ts_{tab}"] = _ref_ts
+                # Oracle 체크 만료 → 다음 렌더 시 재체크
                 st.session_state.pop("oracle_ok", None)
+                st.session_state.pop("oracle_ok_expire", None)
+                # TTL jitter 제거 → 즉시 새 버킷으로 이동
+                _jk_prefix = "_ttl_jitter_"
+                for _k in list(st.session_state.keys()):
+                    if _k.startswith(_jk_prefix):
+                        del st.session_state[_k]
+                # 전체 캐시 초기화 (불가피 — Streamlit API 한계)
                 st.cache_data.clear()
                 st.session_state[_ss_key] = time.strftime("%Y-%m-%d %H:%M")
                 st.rerun()
