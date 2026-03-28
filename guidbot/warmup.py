@@ -1,24 +1,28 @@
 """
-warmup.py ─ AI 모델 사전 캐시 워밍업 스크립트
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+warmup.py  ─  AI 모델 사전 캐시 워밍업 스크립트 v2.2
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[v2.2 변경 — search_engine private 접근 완전 제거]
+
+  ❌ 제거:
+    from core.search_engine import _get_query_embedding, _EMBED_CACHE
+    from core.search_engine import _get_retriever
+
+  ✅ 대체:
+    emb.embed_query(q)         → rag_pipeline._EMBED_CACHE 에 자동 저장됨
+    pipeline.warmup_retriever() → RAGPipeline public API
+    pipeline.warmup_ce()        → RAGPipeline public API
+
+  [왜 자동으로 캐시에 저장되나]
+    rag_pipeline._get_query_embedding() 은 모듈 레벨 _EMBED_CACHE 를 사용.
+    warmup 에서 emb.embed_query(q) 를 직접 호출해도 되지만,
+    pipeline.warmup_retriever() 가 내부적으로 임베딩을 포함하므로
+    별도 사전 임베딩 없이도 파이프라인 초기화만으로 캐시 준비 완료.
 
 [목적]
-  streamlit run main.py 실행 전에 이 스크립트를 먼저 실행하면
-  무거운 AI 모델이 디스크 캐시에 올라옵니다.
-  이후 Streamlit 시작 시 캐시 히트로 로딩이 크게 단축됩니다.
-
-  최초 실행: ~30초 (350MB 모델 다운로드 + 캐시)
-  이후 실행:  ~3초 (캐시 히트)
-
-[실행 방법]
-  # 최초 설치 후 또는 모델 업데이트 후 1회 실행
-  python warmup.py
-
-  # start.bat 에서 자동 실행됨 (매번 실행, 캐시 히트 시 3초 이내)
-
-[실제 속도 개선 효과]
-  warmup 없이 Streamlit 시작: 15~20초 (사용자가 빈 화면 대기)
-  warmup 후  Streamlit 시작:  3~5초  (캐시에서 즉시 로드)
+  streamlit run main.py 전에 실행 → 무거운 AI 모델 캐시 선점.
+  최초 실행: ~30초 (모델 다운로드 + 캐시)
+  이후 실행:  ~3초  (캐시 히트)
 """
 
 from __future__ import annotations
@@ -27,11 +31,9 @@ import sys
 import time
 from pathlib import Path
 
-# 프로젝트 루트를 Python 경로에 추가
 sys.path.insert(0, str(Path(__file__).parent))
 
-
-# 자주 쓰는 쿼리 사전 임베딩 목록 (앱 시작 시 미리 캐시)
+# 자주 쓰는 쿼리 사전 임베딩 목록
 _WARMUP_QUERIES = [
     "연차휴가 신청",
     "당직 수당",
@@ -48,15 +50,10 @@ def warmup_embedding_model() -> bool:
     """
     임베딩 모델 워밍업 + 자주 쓰는 쿼리 사전 임베딩.
 
-    [v2.0 개선]
-    · _WARMUP_QUERIES 사전 임베딩 → search_engine._EMBED_CACHE 채움
-    · 실제 질문과 유사한 쿼리들을 미리 임베딩해두면
-      비슷한 질문 입력 시 캐시 히트율 향상
-    · 전체 예열 ~10초 → 사용자가 첫 질문 전에 완료
-
-    [효과]
-    첫 질문: 캐시 미스 → ~8~10초 (불가피)
-    이후 비슷한 질문: 캐시 히트 → ~0.1초
+    [v2.2 변경]
+    · search_engine._EMBED_CACHE 직접 접근 제거
+    · emb.embed_query() 만 호출 → rag_pipeline 캐시에 자동 저장
+    · 별도 hashlib 처리 불필요 (캐싱은 rag_pipeline 내부에서 처리)
     """
     print("  임베딩 모델 로딩 중 (ko-sroberta-multitask)...")
     t0 = time.time()
@@ -65,30 +62,24 @@ def warmup_embedding_model() -> bool:
 
         emb = get_embeddings_auto()
 
-        # 기본 JIT 예열
+        # JIT 예열 (첫 추론 지연 제거)
         _ = emb.embed_query("병원 규정 테스트")
         elapsed = time.time() - t0
         print(f"  ✅ 임베딩 모델 로드 완료 ({elapsed:.1f}초)")
 
-        # 자주 쓰는 쿼리 사전 임베딩 → search_engine 캐시 주입
+        # 자주 쓰는 쿼리 사전 임베딩
         print(f"  사전 임베딩 중 ({len(_WARMUP_QUERIES)}개 쿼리)...")
         t1 = time.time()
         try:
-            from core.search_engine import _get_query_embedding, _EMBED_CACHE
-
-            # search_engine 캐시에 직접 저장
+            # [v2.2] search_engine private 접근 제거
+            # emb.embed_query() 호출 시 rag_pipeline._EMBED_CACHE 에 자동 저장됨
             for q in _WARMUP_QUERIES:
-                import hashlib
-
-                _k = hashlib.md5(q.strip().lower().encode()).hexdigest()[:12]
-                if _k not in _EMBED_CACHE:
-                    _EMBED_CACHE[_k] = emb.embed_query(q)
+                emb.embed_query(q)
             print(
                 f"  ✅ 사전 임베딩 완료: {len(_WARMUP_QUERIES)}개 ({time.time() - t1:.1f}초)"
             )
         except Exception as _ce:
-            # search_engine 캐시 주입 실패해도 모델 자체는 OK
-            print(f"  ⚠️  캐시 주입 건너뜀: {_ce}")
+            print(f"  ⚠️  사전 임베딩 건너뜀: {_ce}")
 
         return True
     except Exception as exc:
@@ -105,7 +96,6 @@ def warmup_cross_encoder() -> bool:
 
         ce = _load_cross_encoder()
         if ce:
-            # JIT 예열
             ce.predict(
                 [("연차휴가 신청", "제26조 연차휴가")],
                 num_workers=0,
@@ -145,9 +135,7 @@ def warmup_vector_db() -> bool:
         elapsed = time.time() - t0
 
         if db:
-            print(
-                f"  ✅ 벡터 DB 준비 완료 ({db.index.ntotal:,}개 벡터, {elapsed:.1f}초)"
-            )
+            print(f"  ✅ 벡터 DB 준비 완료 ({db.index.ntotal:,}개 벡터, {elapsed:.1f}초)")
         else:
             print("  ❌ 벡터 DB 로드 실패")
         return db is not None
@@ -157,13 +145,19 @@ def warmup_vector_db() -> bool:
 
 
 def warmup_bm25_index() -> bool:
-    """BM25 인덱스 사전 구축 — 첫 번째 검색 14초 제거."""
-    print("  📊 BM25 인덱스 구축 중 (24,000개 문서 토크나이징)...")
+    """
+    BM25 인덱스 사전 구축 — 첫 번째 검색 14초 제거.
+
+    [v2.2 변경]
+    · from core.search_engine import _get_retriever  ❌ (private, 삭제됨)
+    · pipeline.warmup_retriever()                    ✅ (RAGPipeline public API)
+    """
+    print("  📊 BM25 인덱스 구축 중 (문서 토크나이징)...")
     t0 = time.time()
     try:
         from config.settings import settings
         from core.vector_store import VectorStoreManager
-        from core.search_engine import _get_retriever
+        from core.rag_pipeline import get_pipeline  # [v2.2] public API
 
         manager = VectorStoreManager(
             db_path=settings.rag_db_path,
@@ -175,12 +169,12 @@ def warmup_bm25_index() -> bool:
             print("  ⚠️  벡터 DB 없음 → BM25 건너뜀")
             return False
 
-        retriever = _get_retriever(db)
-        retriever._ensure_bm25()
+        # [v2.2] pipeline public API 사용 (search_engine private 제거)
+        pipeline = get_pipeline(db)
+        pipeline.warmup_retriever()
 
         elapsed = time.time() - t0
-        count = len(retriever._bm25.documents) if retriever._bm25 else 0
-        print(f"  ✅ BM25 인덱스 구축 완료: {count:,}개 문서 ({elapsed:.1f}초)")
+        print(f"  ✅ BM25 인덱스 구축 완료 ({elapsed:.1f}초)")
         return True
     except Exception as exc:
         print(f"  ⚠️  BM25 건너뜀: {exc}")
@@ -193,20 +187,19 @@ def check_env() -> bool:
     try:
         from config.settings import settings
 
-        warnings = []
+        warnings_list = []
         if not settings.get_google_api_key():
-            warnings.append("GOOGLE_API_KEY 미설정 — Gemini 답변 불가")
+            warnings_list.append("GOOGLE_API_KEY 미설정 — Gemini 답변 불가")
 
-        # admin_password 기본값 경고
         try:
             pw = settings.admin_password.get_secret_value()
             if pw in ("moonhwa", "password", "1234", "admin"):
-                warnings.append(f"ADMIN_PASSWORD='{pw}' — 취약한 기본값! 변경 필요")
+                warnings_list.append(f"ADMIN_PASSWORD='{pw}' — 취약한 기본값! 변경 필요")
         except Exception:
             pass
 
-        if warnings:
-            for w in warnings:
+        if warnings_list:
+            for w in warnings_list:
                 print(f"  ⚠️  {w}")
         else:
             print("  ✅ 환경 설정 정상")
@@ -220,34 +213,24 @@ def main() -> int:
     """워밍업 메인 함수."""
     print()
     print("=" * 52)
-    print("  🏥 좋은문화병원 AI 가이드봇 — 사전 워밍업")
+    print("  🏥 좋은문화병원 AI 가이드봇 — 사전 워밍업 v2.2")
     print("=" * 52)
     print()
 
     t_start = time.time()
     results = {}
 
-    # 1. 환경 설정 확인
     results["env"] = check_env()
     print()
-
-    # 2. 임베딩 모델 (가장 무거움, 먼저 시작)
     results["embedding"] = warmup_embedding_model()
     print()
-
-    # 3. CE 모델
     results["ce"] = warmup_cross_encoder()
     print()
-
-    # 4. 벡터 DB (임베딩 캐시 히트로 빠름)
     results["db"] = warmup_vector_db()
     print()
-
-    # 5. BM25 인덱스 구축 (첫 검색 14초 제거 핵심)
     results["bm25"] = warmup_bm25_index()
     print()
 
-    # 결과 요약
     total = time.time() - t_start
     all_ok = results.get("embedding") and results.get("db")
     bm25_ok = results.get("bm25", False)
@@ -259,14 +242,12 @@ def main() -> int:
         print("  [속도 기대치]")
         print("  첫 번째 질문:  ~8~10초 (임베딩 추론)")
         print("  두 번째 동일:   ~0.1초 (캐시 히트)")
-        print("  재검색(캐시):   ~0.1초 (캐시 히트)")
         if bm25_ok:
-            print("  BM25:          준비 완료 (백그라운드 불필요)")
+            print("  BM25:          준비 완료")
         print()
         print("  streamlit run main.py --server.port 8502")
     else:
         print(f"  ⚠️  워밍업 일부 실패 (총 {total:.1f}초)")
-        print("  Streamlit 은 시작할 수 있으나 첫 검색이 느릴 수 있습니다.")
     print("=" * 52)
     print()
 

@@ -1,6 +1,6 @@
 """
-ui/sidebar.py  ─  사이드바 렌더링 v7.1
-[v7.1] 사이드바 모든 버튼 단일 CSS로 완전 통일
+ui/sidebar.py  ─  사이드바 렌더링 v7.2
+[v7.2] 회람 문서 버튼에 최근 업데이트 일자 + 1줄 요약 추가
 """
 
 from __future__ import annotations
@@ -18,23 +18,14 @@ from utils.exceptions import GuidbotError
 
 logger = get_logger(__name__, log_dir=settings.log_dir)
 
-# ── 검색 모드 목록 ──────────────────────────────────────────────────
-# 각 항목의 id는 session_state["search_mode"] 값과 일치해야 함
-# "separator" 는 구분선 역할만 하는 특수 항목
-# "admin_only" 가 True 이면 관리자만 볼 수 있음
 _SEARCH_MODES: list[dict] = [
     {"id": "fast", "label": "빠른 검색", "meta": "3건 · 빠른 응답"},
     {"id": "standard", "label": "표준 검색", "meta": "5건 · 균형 검색"},
     {"id": "deep", "label": "심층 검색", "meta": "10건 · 정밀 분석"},
     {"id": "separator", "label": "", "meta": ""},
     {"id": "data_analysis", "label": "데이터 분석", "meta": "Oracle DB · 차트"},
-    # separator2 / ward_dash / finance_dash / opd_dash 제거됨
-    # 병동 대시보드는 dashboard_app.py (포트 8503) 로 완전 분리
-    # 원무/외래는 추후 개발 예정
 ]
 
-# 대시보드 탭 매핑 — 사이드바에서 제거됨 (dashboard_app.py 분리)
-# 코드 참조 오류 방지를 위해 빈 딕셔너리 유지
 _DASH_TABS: dict = {}
 _DEFAULT_SEARCH_MODE = "standard"
 
@@ -48,11 +39,6 @@ class DBHealth:
     recent_files: List[Tuple[str, str]] = field(default_factory=list)
 
 
-# ─────────────────────────────────────────────────────────
-#  [v7.1] 사이드바 전체 버튼 통일 CSS
-#  핵심: [data-testid="stSidebar"] 스코프 + 3중 셀렉터
-#         .sb-btn-wrap 유무와 무관하게 모든 버튼 동일 처리
-# ─────────────────────────────────────────────────────────
 _SIDEBAR_BTN_CSS = """
 <style>
 /* secondary (기본) */
@@ -79,7 +65,6 @@ _SIDEBAR_BTN_CSS = """
     border-color: rgba(255,255,255,0.28) !important;
     color: rgba(255,255,255,0.96) !important;
 }
-
 /* primary (선택/강조) */
 [data-testid="stSidebar"] div[data-testid="stButton"] > button[kind="primary"],
 [data-testid="stSidebar"] [data-testid="stBaseButton-primary"] {
@@ -100,8 +85,7 @@ _SIDEBAR_BTN_CSS = """
 [data-testid="stSidebar"] [data-testid="stBaseButton-primary"]:hover {
     background: rgba(37,99,235,0.40) !important;
 }
-
-/* 포커스/활성 — 주황 outline 차단 + 클릭 후 흰 배경 방지 */
+/* 포커스/활성 */
 [data-testid="stSidebar"] div[data-testid="stButton"] > button:focus,
 [data-testid="stSidebar"] div[data-testid="stButton"] > button:focus-visible,
 [data-testid="stSidebar"] div[data-testid="stButton"] > button:active,
@@ -122,8 +106,7 @@ _SIDEBAR_BTN_CSS = """
     background: rgba(37,99,235,0.40) !important;
     color: rgba(255,255,255,0.97) !important;
 }
-
-/* 버튼 내부 텍스트 색상 고정 */
+/* 버튼 내부 텍스트 */
 [data-testid="stSidebar"] div[data-testid="stButton"] > button p,
 [data-testid="stSidebar"] div[data-testid="stButton"] > button span,
 [data-testid="stSidebar"] div[data-testid="stButton"] > button div {
@@ -131,13 +114,10 @@ _SIDEBAR_BTN_CSS = """
     background: transparent !important;
     font-size: inherit !important;
 }
-
 /* 버튼 간격 */
 [data-testid="stSidebar"] div[data-testid="stButton"] {
     margin-bottom: 0.22rem !important;
 }
-
-/* .sb-btn-wrap 래퍼 */
 [data-testid="stSidebar"] .sb-btn-wrap {
     margin-top: 0.1rem;
 }
@@ -197,7 +177,6 @@ def _render_search_mode_selector() -> None:
                 unsafe_allow_html=True,
             )
             continue
-        # 관리자 전용 항목은 일반 유저에게 완전히 숨김
         if mode.get("admin_only") and _cur_role != "admin":
             continue
         selected = current == mode_id
@@ -210,8 +189,6 @@ def _render_search_mode_selector() -> None:
         if st.button(
             label, key=f"smode_{mode_id}", type=btn_type, use_container_width=True
         ):
-            # _DASH_TABS 키워드는 더 이상 main.py 에서 처리 안 하지만
-            # 관리자용 원무/외래는 여전히 session_state 방식 유지
             if mode_id in _DASH_TABS:
                 st.session_state["search_mode"] = mode_id
                 st.session_state["active_page"] = "hospital_dashboard"
@@ -227,53 +204,135 @@ def _render_search_mode_selector() -> None:
 
 
 def _render_shortcuts() -> None:
+    """
+    바로가기 — v7.4
+    · 회람 문서: 전폭 버튼 + 관리자 업데이트 노트 직접 입력
+    · 진료/원무/간호: 이모지 없이 3열 인라인 그리드 (준비중)
+    · 모든 스타일 인라인 — CSS 클래스 미사용 (사이드바 적용 보장)
+    """
     section_label("바로가기", "")
-    DOCS_URL = (
+
+    _role     = st.session_state.get("role", "user")
+    _is_admin = _role == "admin"
+
+    # ── 업데이트 노트 세션 기본값 ─────────────────────────────────────
+    if "shortcut_note" not in st.session_state:
+        st.session_state["shortcut_note"] = "2026-03-28  산부인과 지침 추가"
+    _note = st.session_state["shortcut_note"]
+
+    # ── 공통 인라인 스타일 상수 ────────────────────────────────────────
+    _S_TITLE = (
+        "font-size:13px;font-weight:700;color:#FFFFFF;"
+        "letter-spacing:-0.01em;flex:1;"
+    )
+    _S_ARR   = "font-size:12px;color:#7BE0F5;font-weight:700;"
+    _S_NOTE  = (
+        "font-size:11px;color:#FFFFFF !important;margin-top:4px;"
+        "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"
+        "font-weight:600;"
+    )
+
+    # ── 회람 문서 버튼 ────────────────────────────────────────────────
+    _DOCS_URL = (
         "https://docs.google.com/document/d/"
         "1WW05jXoSw65WY2vZYkqTxPSBWrv9anvSknWDGWZlj_k/edit"
     )
     st.markdown(
-        f'<a href="{DOCS_URL}" target="_blank" rel="noopener" style="'
-        "display:flex;align-items:center;background:rgba(0,151,178,0.14);"
-        "border:1px solid rgba(0,180,208,0.22);border-radius:6px;padding:0.4rem 0.65rem;"
-        'text-decoration:none;margin-bottom:0.25rem;">'
-        '<span style="font-size:12px;font-weight:600;color:rgba(255,255,255,0.88);">회람 문서</span>'
-        '<span style="margin-left:auto;font-size:10px;color:rgba(0,180,208,0.72);font-weight:600;">↗</span>'
-        "</a>",
+        f'<a href="{_DOCS_URL}" target="_blank" rel="noopener"'
+        f' style="display:block;background:rgba(0,140,180,0.22);'
+        f'border:1.5px solid rgba(0,190,220,0.40);border-radius:8px;'
+        f'padding:0.48rem 0.7rem;text-decoration:none;margin-bottom:5px;">'
+        f'<div style="display:flex;align-items:center;">'
+        f'<span style="{_S_TITLE}">회람 문서</span>'
+        f'<span style="{_S_ARR}">↗</span>'
+        f'</div>'
+        f'<div style="{_S_NOTE}">🕒 {_note}</div>'
+        f'</a>',
         unsafe_allow_html=True,
     )
-    _shortcuts = [
-        ("진료 지침", "#"),
-        ("원무 안내", "#"),
-        ("간호 규정", "#"),
-        ("지원 부서", "#"),
-    ]
-    grid_items = "".join(
-        [
-            f'<div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.07);'
-            f"border-radius:6px;padding:0.35rem 0.55rem;font-size:11px;font-weight:500;"
-            f'color:rgba(255,255,255,0.38);letter-spacing:0.01em;">{label}</div>'
-            for label, _ in _shortcuts
-        ]
+
+    # ── 노트 인라인 편집 — 수정 버튼 토글 (누구나 사용 가능) ────────
+    _edit_key = "shortcut_note_editing"
+    if _edit_key not in st.session_state:
+        st.session_state[_edit_key] = False
+
+    # 수정 버튼 / 취소 버튼 — 노트 한 줄 아래 소형 버튼
+    _btn_label = "✏️ 노트 수정" if not st.session_state[_edit_key] else "✕ 닫기"
+    if st.button(_btn_label, key="shortcut_note_toggle", use_container_width=True):
+        st.session_state[_edit_key] = not st.session_state[_edit_key]
+        st.rerun()
+
+    if st.session_state[_edit_key]:
+        # 입력창 글자 잘 보이도록 CSS — 흰 배경 + 검은 글자
+        st.markdown(
+            """<style>
+            /* 사이드바 입력창: 흰 배경 + 검은 글자 강제 */
+            [data-testid="stSidebar"] input[type="text"] {
+                color: #1E293B !important;
+                background: #FFFFFF !important;
+                -webkit-text-fill-color: #1E293B !important;
+                border: 2px solid #38BDF8 !important;
+                border-radius: 6px !important;
+                font-size: 12px !important;
+                font-weight: 600 !important;
+                caret-color: #0284C7 !important;
+            }
+            [data-testid="stSidebar"] input[type="text"]:focus {
+                color: #1E293B !important;
+                background: #FFFFFF !important;
+                -webkit-text-fill-color: #1E293B !important;
+            }
+            [data-testid="stSidebar"] input[type="text"]::placeholder {
+                color: #94A3B8 !important;
+                -webkit-text-fill-color: #94A3B8 !important;
+                opacity: 1 !important;
+            }
+            </style>""",
+            unsafe_allow_html=True,
+        )
+        _new_note = st.text_input(
+            "업데이트 노트",
+            value=_note,
+            key="shortcut_note_input",
+            placeholder="예) 2026-03-28  산부인과 지침 추가",
+            label_visibility="collapsed",
+        )
+        if st.button("💾 저장", key="shortcut_note_save",
+                     use_container_width=True, type="primary"):
+            st.session_state["shortcut_note"] = _new_note
+            st.session_state[_edit_key] = False
+            st.rerun()
+
+    # ── 진료 / 원무 / 간호 — 3열 그리드 (준비중) ──────────────────────
+    # 준비중 항목: 이모지 없이 텍스트만, 밝은 색상으로 가시성 확보
+    _CELL_S = (
+        "flex:1;border:1px solid rgba(255,255,255,0.15);"
+        "border-radius:7px;padding:7px 4px;text-align:center;"
+        "background:rgba(255,255,255,0.05);"
     )
+    _LBL_S  = "display:block;font-size:12px;font-weight:700;color:#D1E8F5;"
+    _SUB_S  = "display:block;font-size:9px;color:#7BAEC4;margin-top:2px;"
+
+    _cells = "".join([
+        f'<div style="{_CELL_S}">'
+        f'<span style="{_LBL_S}">{lbl}</span>'
+        f'<span style="{_SUB_S}">준비중</span>'
+        f'</div>'
+        for lbl in ("진료", "원무", "간호")
+    ])
     st.markdown(
-        f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.22rem;">{grid_items}</div>',
+        f'<div style="display:flex;gap:4px;margin-top:5px;">{_cells}</div>',
         unsafe_allow_html=True,
     )
 
 
 def _render_system_status(db_health: DBHealth) -> None:
-    """
-    시스템 상태 — v7.2 슬림화.
-    일반 유저: 상태 표시 2줄만 (RAG + Oracle)
-    관리자: 상세 수치 + Oracle 액션 expander
-    """
+    """시스템 상태 — v7.2"""
     section_label("시스템 상태", "")
 
-    _role = st.session_state.get("role", "user")
+    _role     = st.session_state.get("role", "user")
     _is_admin = _role == "admin"
 
-    # Oracle 연결 상태 확인
     oracle_enabled: bool = getattr(settings, "oracle_enabled", False)
     if "oracle_status" not in st.session_state:
         st.session_state["oracle_status"] = None
@@ -283,23 +342,19 @@ def _render_system_status(db_health: DBHealth) -> None:
         if st.session_state["oracle_status"] is None:
             try:
                 from db.oracle_client import test_connection
-
                 _ok, _msg = test_connection()
                 st.session_state["oracle_status"] = (_ok, _msg)
             except Exception as _exc:
                 st.session_state["oracle_status"] = (False, f"모듈 오류: {_exc}")
         _oc_ok, _oc_msg = st.session_state["oracle_status"]
 
-    # 공통: 상태 표시 (일반 유저도 이 2줄은 봄)
     status_indicator(db_health.is_healthy, db_health.message)
     if oracle_enabled:
         status_indicator(_oc_ok, f"Oracle · {_oc_msg}")
 
-    # 관리자만: 상세 수치 + Oracle 액션 expander
     if _is_admin:
         try:
             from utils.startup_optimizer import is_warmup_ready
-
             _bm25_ready = "준비 완료" if is_warmup_ready() else "워밍업 중..."
         except Exception:
             _bm25_ready = "-"
@@ -307,53 +362,39 @@ def _render_system_status(db_health: DBHealth) -> None:
         info_grid(
             [
                 ("청크 (벡터)", f"{db_health.doc_count:,} 개"),
-                ("원본 PDF", f"{db_health.file_count:,} 개"),
-                ("AI 엔진", "Gemini"),
-                ("검색 엔진", f"RAG+BM25({_bm25_ready})"),
+                ("원본 PDF",    f"{db_health.file_count:,} 개"),
+                ("AI 엔진",    "Gemini"),
+                ("검색 엔진",  f"RAG+BM25({_bm25_ready})"),
             ]
         )
 
         if oracle_enabled:
-            # Oracle 액션을 expander 안으로 이동 — 실수로 누르는 사고 방지
             with st.expander("⚙️ Oracle 설정", expanded=False):
                 st.markdown(
                     '<div style="font-size:10px;color:rgba(255,255,255,0.32);'
                     'margin-bottom:0.35rem;">연결 관리 — 신중하게 사용하세요</div>',
                     unsafe_allow_html=True,
                 )
-                if st.button(
-                    "재연결",
-                    key="btn_oracle_reconnect",
-                    use_container_width=True,
-                    help="Oracle 연결 풀 초기화 후 재연결",
-                ):
+                if st.button("재연결", key="btn_oracle_reconnect",
+                             use_container_width=True, help="Oracle 연결 풀 초기화 후 재연결"):
                     st.session_state["oracle_status"] = None
                     try:
                         from db.oracle_client import close_pool
-
                         close_pool()
                     except Exception:
                         pass
                     st.rerun()
 
-                if st.button(
-                    "상태 확인",
-                    key="btn_oracle_check",
-                    use_container_width=True,
-                    help="연결 상태 즉시 재확인",
-                ):
+                if st.button("상태 확인", key="btn_oracle_check",
+                             use_container_width=True, help="연결 상태 즉시 재확인"):
                     st.session_state["oracle_status"] = None
                     st.rerun()
 
-                if st.button(
-                    "스키마 캐시 초기화",
-                    key="btn_schema_cache_clear",
-                    use_container_width=True,
-                    help="COLUMN_DESCS 수정 후 — 다음 SQL 생성 시 DB에서 재로드",
-                ):
+                if st.button("스키마 캐시 초기화", key="btn_schema_cache_clear",
+                             use_container_width=True,
+                             help="COLUMN_DESCS 수정 후 — 다음 SQL 생성 시 DB에서 재로드"):
                     try:
                         from db.oracle_access_config import get_access_config_manager
-
                         get_access_config_manager().invalidate_cache()
                         st.success("캐시 초기화 완료")
                     except Exception as _e:
@@ -407,7 +448,6 @@ def _render_monitoring_panel() -> None:
     }
     try:
         from utils.monitor import get_metrics as _gm
-
         stats.update(_gm().get_stats())
     except Exception as exc:
         logger.warning(f"모니터링 stats 로드 실패: {exc}")
@@ -417,10 +457,10 @@ def _render_monitoring_panel() -> None:
     error_pct = raw_error if raw_error > 1.0 else raw_error * 100
     info_grid(
         [
-            ("총 질문", f"{stats.get('query_count', 0):,}회"),
+            ("총 질문",   f"{stats.get('query_count', 0):,}회"),
             ("평균 검색", f"{stats.get('avg_search_ms', 0):.0f}ms"),
             ("평균 응답", f"{stats.get('avg_stream_ms', 0):.0f}ms"),
-            ("오류율", f"{error_pct:.1f}%"),
+            ("오류율",    f"{error_pct:.1f}%"),
         ]
     )
     last_queries: list = stats.get("last_queries", [])
@@ -519,20 +559,12 @@ def _render_admin_panel() -> None:
                 unsafe_allow_html=True,
             )
 
-            if st.button(
-                "SQL 대시보드",
-                key="admin_goto_sql",
-                use_container_width=True,
-                help="직접 SQL 입력/실행 + 자유 시각화 + AI 분석",
-            ):
+            if st.button("SQL 대시보드", key="admin_goto_sql", use_container_width=True,
+                         help="직접 SQL 입력/실행 + 자유 시각화 + AI 분석"):
                 st.session_state["active_page"] = "sql_dashboard"
                 st.rerun()
-            if st.button(
-                "문서 관리",
-                key="admin_goto_docs",
-                use_container_width=True,
-                help="쿼리 예제 · 테이블 명세 등록 / 관리",
-            ):
+            if st.button("문서 관리", key="admin_goto_docs", use_container_width=True,
+                         help="쿼리 예제 · 테이블 명세 등록 / 관리"):
                 st.session_state["active_page"] = "doc_manager"
                 st.rerun()
 
@@ -554,21 +586,15 @@ def _render_admin_panel() -> None:
                 key="admin_upload",
                 label_visibility="collapsed",
             )
-            if st.button(
-                "DB 업데이트",
-                use_container_width=True,
-                type="primary",
-                key="admin_db_update",
-            ):
+            if st.button("DB 업데이트", use_container_width=True, type="primary",
+                         key="admin_db_update"):
                 if new_files:
                     _handle_admin_upload(new_files)
                 else:
                     st.warning("업로드할 PDF를 먼저 선택해주세요.")
         else:
             pw = st.text_input(
-                "패스워드",
-                type="password",
-                key="admin_pw",
+                "패스워드", type="password", key="admin_pw",
                 placeholder="관리자 패스워드 입력",
                 label_visibility="collapsed",
             )
