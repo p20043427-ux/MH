@@ -72,6 +72,7 @@ from typing import Any, Dict, List, Optional
 
 import streamlit as st
 
+# [차트 엔진 체크] Plotly 및 Pandas 가용성 확인
 try:
     import plotly.graph_objects as go
     HAS_PLOTLY = True
