@@ -2247,7 +2247,8 @@ def _render_ward() -> None:
                 f'<th style="{_tH}text-align:right;">입원</th>'
                 f'<th style="{_tH}text-align:right;">재원</th>'
                 f'<th style="{_tH}text-align:right;">퇴원</th>'
-                f'<th style="{_tH}text-align:right;color:#7C3AED;">퇴원예정</th>'
+                f'<th style="{_tH}text-align:right;color:#0891B2;">금일예고</th>'
+                f'<th style="{_tH}text-align:right;color:#7C3AED;">익일예고</th>'
                 f'<th style="{_tH}text-align:right;color:#8B5CF6;">수술</th>'
                 f'<th style="{_tH}text-align:right;">가동률</th>'
                 f'<th style="{_tH}text-align:right;">잔여병상</th>'
@@ -2263,7 +2264,8 @@ def _render_ward() -> None:
                     disc  = _safe_int(r.get("금일퇴원"))
                     tot   = _safe_int(r.get("총병상"))
                     rest  = max(0, tot - stay)
-                    n_disc  = _safe_int(r.get("익일퇴원예고"))
+                    t_disc  = _safe_int(r.get("금일퇴원예고"))  # 금일 DC 예고
+                    n_disc  = _safe_int(r.get("익일퇴원예고"))  # 익일 DC 예고
                     n_avail = max(0, rest + n_disc)
                     r_cls = "#DC2626" if rate >= 90 else "#F59E0B" if rate >= 80 else "#059669"
                     _td = f"padding:8px 12px;background:{bg};border-bottom:1px solid #F8FAFC;vertical-align:middle;"
@@ -2274,6 +2276,7 @@ def _render_ward() -> None:
                         f'<td style="{_td}text-align:right;color:{C["primary_text"]};font-family:Consolas,monospace;font-weight:700;">{adm}</td>'
                         f'<td style="{_td}text-align:right;color:#0F172A;font-family:Consolas,monospace;font-weight:700;">{stay}</td>'
                         f'<td style="{_td}text-align:right;color:#475569;font-family:Consolas,monospace;font-weight:600;">{disc}</td>'
+                        f'<td style="{_td}text-align:right;color:#0891B2;font-family:Consolas,monospace;font-weight:600;">{t_disc if t_disc > 0 else "─"}</td>'
                         f'<td style="{_td}text-align:right;color:#7C3AED;font-family:Consolas,monospace;font-weight:600;">{n_disc if n_disc > 0 else "─"}</td>'
                         f'<td style="{_td}text-align:right;font-weight:600;'
                         f'color:{"#8B5CF6" if _ward_surg.get(r.get("병동명", ""), 0) > 0 else "#CBD5E1"};font-family:Consolas,monospace;">'
@@ -2288,7 +2291,8 @@ def _render_ward() -> None:
                 _ta    = sum(_safe_int(r.get("금일입원")) for r in bed_detail_f)
                 _ts    = sum(_safe_int(r.get("재원수")) for r in bed_detail_f)
                 _td2   = sum(_safe_int(r.get("금일퇴원")) for r in bed_detail_f)
-                _tndc  = sum(_safe_int(r.get("익일퇴원예고")) for r in bed_detail_f)
+                _ttdc  = sum(_safe_int(r.get("금일퇴원예고")) for r in bed_detail_f)  # 금일예고 합계
+                _tndc  = sum(_safe_int(r.get("익일퇴원예고")) for r in bed_detail_f)  # 익일예고 합계
                 _tr    = round(_ts / max(_tb, 1) * 100, 1)
                 _sth   = "padding:8px 12px;background:#EFF6FF;border-top:2px solid #BFDBFE;vertical-align:middle;font-weight:700;"
                 rows_html += (
@@ -2298,6 +2302,7 @@ def _render_ward() -> None:
                     f'<td style="{_sth}text-align:right;color:{C["primary_text"]};font-family:Consolas,monospace;">{_ta}</td>'
                     f'<td style="{_sth}text-align:right;color:#0F172A;font-family:Consolas,monospace;">{_ts}</td>'
                     f'<td style="{_sth}text-align:right;color:#64748B;font-family:Consolas,monospace;">{_td2}</td>'
+                    f'<td style="{_sth}text-align:right;color:#0891B2;font-family:Consolas,monospace;">{_ttdc if _ttdc > 0 else "─"}</td>'
                     f'<td style="{_sth}text-align:right;color:#7C3AED;font-family:Consolas,monospace;">{_tndc if _tndc > 0 else "─"}</td>'
                     f'<td style="{_sth}text-align:right;color:#8B5CF6;font-family:Consolas,monospace;">{sum(_ward_surg.values()) or "─"}</td>'
                     f'<td style="{_sth}text-align:right;color:#1E40AF;font-family:Consolas,monospace;">{_tr:.1f}%</td>'
