@@ -621,7 +621,7 @@ def _render_chat_tab(vector_db, db_health: DBHealth) -> None:
             st.warning("벡터 DB가 없습니다. build_db.py를 먼저 실행해 주세요.")
         elif search_mode == "data_analysis":
             with st.chat_message("assistant"):
-                render_data_analysis_tab(query=prompt, vector_db=vector_db)
+                render_data_analysis_tab()
         else:
             with st.chat_message("assistant"):
                 full_text, sources, pipeline_result = _stream_answer(
@@ -674,7 +674,7 @@ def main() -> None:
         if _is_data:
             tabs = st.tabs(["📊 데이터 분석", "📊 벤치마크", "📋 로그"])
             with tabs[0]:
-                render_data_analysis_tab(query=None, vector_db=vector_db)
+                render_data_analysis_tab()
             with tabs[1]:
                 _render_benchmark_tab(vector_db=vector_db)
             with tabs[2]:
@@ -690,7 +690,7 @@ def main() -> None:
     else:
         # 일반 유저 — 탭 없이 바로 화면 표시
         if _is_data:
-            render_data_analysis_tab(query=None, vector_db=vector_db)
+            render_data_analysis_tab()
         else:
             _render_chat_tab(vector_db=vector_db, db_health=db_health)
 

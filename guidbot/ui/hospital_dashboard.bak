@@ -72,6 +72,7 @@ from typing import Any, Dict, List, Optional
 
 import streamlit as st
 
+# [차트 엔진 체크] Plotly 및 Pandas 가용성 확인
 try:
     import plotly.graph_objects as go
     HAS_PLOTLY = True
@@ -1670,7 +1671,7 @@ def _render_ward() -> None:
     _next_disc  = int(_first_bed.get("익일퇴원예약", 0) or 0)
 
     _total_rest    = sum(max(0, _safe_int(r.get("총병상")) - _safe_int(r.get("재원수"))) for r in bed_detail_f)
-    _total_ndc_pre = sum(_safe_int(r.get("익일퇴원예고")) for r in bed_detail_f)
+    _total_ndc_pre = sum(_safe_int(r.get("익일퇴원예약")) for r in bed_detail_f)  # 익일가용 계산 기준
 
     # ── 가동률 색상 ───────────────────────────────────────────────────
     if occ_rate >= 90:
@@ -2235,23 +2236,39 @@ def _render_ward() -> None:
 
         if chart_type_ward == "table":
             # ── 기존 풍부한 HTML 테이블 (퇴원예정, 수술, 잔여병상, 익일가용 포함) ──
+            # 헤더 공통 스타일 — white-space 제거하여 줄바꿈 허용
             _tH = (
-                "padding:9px 12px;font-size:11px;font-weight:700;"
-                "text-transform:uppercase;letter-spacing:.07em;"
+                "padding:7px 6px;font-size:10px;font-weight:700;"
+                "text-transform:uppercase;letter-spacing:.04em;"
                 "color:#64748B;border-bottom:1.5px solid #E2E8F0;"
-                "background:#F8FAFC;white-space:nowrap;"
+                "background:#F8FAFC;word-break:keep-all;line-height:1.3;"
             )
+            # 컬럼별 너비 고정 (table-layout:fixed 와 함께 사용)
+            _W = {
+                "병동":     "width:72px;",
+                "총병상":   "width:52px;",
+                "입원":     "width:44px;",
+                "재원":     "width:44px;",
+                "퇴원":     "width:44px;",
+                "금일예정": "width:58px;",   # 금일퇴원예정
+                "익일예정": "width:58px;",   # 익일퇴원예정
+                "수술":     "width:44px;",
+                "가동률":   "width:56px;",
+                "잔여":     "width:50px;",
+                "익일가용": "width:56px;",
+            }
             _th = (
-                f'<th style="{_tH}text-align:left;">병동</th>'
-                f'<th style="{_tH}text-align:right;">총병상</th>'
-                f'<th style="{_tH}text-align:right;">입원</th>'
-                f'<th style="{_tH}text-align:right;">재원</th>'
-                f'<th style="{_tH}text-align:right;">퇴원</th>'
-                f'<th style="{_tH}text-align:right;color:#7C3AED;">퇴원예정</th>'
-                f'<th style="{_tH}text-align:right;color:#8B5CF6;">수술</th>'
-                f'<th style="{_tH}text-align:right;">가동률</th>'
-                f'<th style="{_tH}text-align:right;">잔여병상</th>'
-                f'<th style="{_tH}text-align:right;color:#059669;">익일가용</th>'
+                f'<th style="{_tH}{_W["병동"]}text-align:left;">병동</th>'
+                f'<th style="{_tH}{_W["총병상"]}text-align:right;">총병상</th>'
+                f'<th style="{_tH}{_W["입원"]}text-align:right;">입원</th>'
+                f'<th style="{_tH}{_W["재원"]}text-align:right;">재원</th>'
+                f'<th style="{_tH}{_W["퇴원"]}text-align:right;">퇴원</th>'
+                f'<th style="{_tH}{_W["금일예정"]}text-align:right;color:#0284C7;">금일<br>퇴원예정</th>'
+                f'<th style="{_tH}{_W["익일예정"]}text-align:right;color:#7C3AED;">익일<br>퇴원예정</th>'
+                f'<th style="{_tH}{_W["수술"]}text-align:right;color:#8B5CF6;">수술</th>'
+                f'<th style="{_tH}{_W["가동률"]}text-align:right;">가동률</th>'
+                f'<th style="{_tH}{_W["잔여"]}text-align:right;">잔여<br>병상</th>'
+                f'<th style="{_tH}{_W["익일가용"]}text-align:right;color:#059669;">익일<br>가용</th>'
             )
             rows_html = ""
             if bed_detail_f:
@@ -2263,34 +2280,47 @@ def _render_ward() -> None:
                     disc  = _safe_int(r.get("금일퇴원"))
                     tot   = _safe_int(r.get("총병상"))
                     rest  = max(0, tot - stay)
-                    n_disc  = _safe_int(r.get("익일퇴원예고"))
+                    t_disc  = _safe_int(r.get("금일퇴원예고"))  # 금일퇴원예정
+                    n_disc  = _safe_int(r.get("익일퇴원예약"))  # 익일퇴원예정
                     n_avail = max(0, rest + n_disc)
                     r_cls = "#DC2626" if rate >= 90 else "#F59E0B" if rate >= 80 else "#059669"
-                    _td = f"padding:8px 12px;background:{bg};border-bottom:1px solid #F8FAFC;vertical-align:middle;"
+                    _td = f"padding:7px 6px;background:{bg};border-bottom:1px solid #F1F5F9;vertical-align:middle;"
+                    # 공통 숫자 셀 스타일
+                    _num = f"{_td}text-align:right;font-family:Consolas,monospace;font-size:13px;"
+                    _surg_cnt = _ward_surg.get(r.get("병동명", ""), 0)
                     rows_html += (
                         f"<tr>"
-                        f'<td style="{_td}color:#0F172A;font-weight:600;">{r.get("병동명", "")}</td>'
-                        f'<td style="{_td}text-align:right;color:#64748B;font-family:Consolas,monospace;">{tot}</td>'
-                        f'<td style="{_td}text-align:right;color:{C["primary_text"]};font-family:Consolas,monospace;font-weight:700;">{adm}</td>'
-                        f'<td style="{_td}text-align:right;color:#0F172A;font-family:Consolas,monospace;font-weight:700;">{stay}</td>'
-                        f'<td style="{_td}text-align:right;color:#475569;font-family:Consolas,monospace;font-weight:600;">{disc}</td>'
-                        f'<td style="{_td}text-align:right;color:#7C3AED;font-family:Consolas,monospace;font-weight:600;">{n_disc if n_disc > 0 else "─"}</td>'
-                        f'<td style="{_td}text-align:right;font-weight:600;'
-                        f'color:{"#8B5CF6" if _ward_surg.get(r.get("병동명", ""), 0) > 0 else "#CBD5E1"};font-family:Consolas,monospace;">'
-                        f"{_ward_surg.get(r.get('병동명', ''), 0) or '─'}</td>"
-                        f'<td style="{_td}text-align:right;color:{r_cls};font-family:Consolas,monospace;font-weight:700;">{rate:.1f}%</td>'
-                        f'<td style="{_td}text-align:right;font-weight:700;'
-                        f'color:{"#EF4444" if rate >= 95 else "#F59E0B" if rate >= 85 else "#16A34A"};font-family:Consolas,monospace;">{rest}</td>'
-                        f'<td style="{_td}text-align:right;font-weight:700;'
-                        f'color:{"#059669" if n_avail > 0 else "#94A3B8"};font-family:Consolas,monospace;">{n_avail}</td></tr>'
+                        # 병동명 — 진하게, 좌측정렬
+                        f'<td style="{_td}color:#0F172A;font-weight:700;font-size:13px;">{r.get("병동명", "")}</td>'
+                        # 총병상 — 회색 (변하지 않는 기준값)
+                        f'<td style="{_num}color:#94A3B8;font-weight:500;">{tot}</td>'
+                        # 금일입원 — 파랑 강조
+                        f'<td style="{_num}color:#1D4ED8;font-weight:700;">{adm}</td>'
+                        # 재원수 — 진하게 (핵심 수치)
+                        f'<td style="{_num}color:#0F172A;font-weight:700;">{stay}</td>'
+                        # 금일퇴원 — 중간 회색
+                        f'<td style="{_num}color:#475569;font-weight:500;">{disc}</td>'
+                        # 금일퇴원예정 — 청록 (오늘 확보 가능)
+                        f'<td style="{_num}color:#0284C7;font-weight:{"700" if t_disc > 0 else "400"};">{t_disc if t_disc > 0 else "─"}</td>'
+                        # 익일퇴원예정 — 보라 (내일 기준)
+                        f'<td style="{_num}color:#7C3AED;font-weight:{"700" if n_disc > 0 else "400"};">{n_disc if n_disc > 0 else "─"}</td>'
+                        # 수술 — 연보라 (있을 때만 강조)
+                        f'<td style="{_num}color:{"#7C3AED" if _surg_cnt > 0 else "#CBD5E1"};font-weight:{"700" if _surg_cnt > 0 else "400"};">{_surg_cnt if _surg_cnt > 0 else "─"}</td>'
+                        # 가동률 — 색상 분기 (위험/주의/정상)
+                        f'<td style="{_num}color:{r_cls};font-weight:700;">{rate:.1f}%</td>'
+                        # 잔여병상 — 색상 분기 (부족할수록 붉게)
+                        f'<td style="{_num}color:{"#DC2626" if rate >= 95 else "#F59E0B" if rate >= 85 else "#16A34A"};font-weight:700;">{rest}</td>'
+                        # 익일가용 — 녹색 (여유있을 때) / 회색 (없을 때)
+                        f'<td style="{_num}color:{"#059669" if n_avail > 0 else "#94A3B8"};font-weight:{"700" if n_avail > 0 else "400"};">{n_avail}</td></tr>'
                     )
                 _tb    = sum(_safe_int(r.get("총병상")) for r in bed_detail_f)
                 _ta    = sum(_safe_int(r.get("금일입원")) for r in bed_detail_f)
                 _ts    = sum(_safe_int(r.get("재원수")) for r in bed_detail_f)
                 _td2   = sum(_safe_int(r.get("금일퇴원")) for r in bed_detail_f)
-                _tndc  = sum(_safe_int(r.get("익일퇴원예고")) for r in bed_detail_f)
+                _ttdc  = sum(_safe_int(r.get("금일퇴원예고")) for r in bed_detail_f)  # 금일퇴원예정 합계
+                _tndc  = sum(_safe_int(r.get("익일퇴원예약")) for r in bed_detail_f)  # 익일퇴원예정 합계
                 _tr    = round(_ts / max(_tb, 1) * 100, 1)
-                _sth   = "padding:8px 12px;background:#EFF6FF;border-top:2px solid #BFDBFE;vertical-align:middle;font-weight:700;"
+                _sth   = "padding:7px 6px;background:#EFF6FF;border-top:2px solid #BFDBFE;vertical-align:middle;font-weight:700;font-size:13px;font-family:Consolas,monospace;"
                 rows_html += (
                     f"<tr>"
                     f'<td style="{_sth}color:#1E40AF;">합계</td>'
@@ -2298,6 +2328,7 @@ def _render_ward() -> None:
                     f'<td style="{_sth}text-align:right;color:{C["primary_text"]};font-family:Consolas,monospace;">{_ta}</td>'
                     f'<td style="{_sth}text-align:right;color:#0F172A;font-family:Consolas,monospace;">{_ts}</td>'
                     f'<td style="{_sth}text-align:right;color:#64748B;font-family:Consolas,monospace;">{_td2}</td>'
+                    f'<td style="{_sth}text-align:right;color:#0891B2;font-family:Consolas,monospace;">{_ttdc if _ttdc > 0 else "─"}</td>'
                     f'<td style="{_sth}text-align:right;color:#7C3AED;font-family:Consolas,monospace;">{_tndc if _tndc > 0 else "─"}</td>'
                     f'<td style="{_sth}text-align:right;color:#8B5CF6;font-family:Consolas,monospace;">{sum(_ward_surg.values()) or "─"}</td>'
                     f'<td style="{_sth}text-align:right;color:#1E40AF;font-family:Consolas,monospace;">{_tr:.1f}%</td>'
@@ -2306,7 +2337,7 @@ def _render_ward() -> None:
                 )
                 body = (
                     f'<div style="overflow-x:auto;">'
-                    f'<table style="width:100%;border-collapse:collapse;font-size:13px;">'
+                    f'<table style="width:100%;border-collapse:collapse;font-size:13px;table-layout:fixed;">'
                     f"<thead><tr>{_th}</tr></thead><tbody>{rows_html}</tbody></table></div>"
                     f'<div style="display:flex;align-items:center;justify-content:space-between;'
                     f'padding:5px 6px 0;border-top:1px solid #F1F5F9;margin-top:4px;flex-wrap:wrap;gap:4px;">'
@@ -2866,7 +2897,7 @@ def render_hospital_dashboard(tab: str = "ward") -> None:
                 st.cache_data.clear()
                 st.session_state[_ss_key] = time.strftime("%Y-%m-%d %H:%M")
                 st.rerun()
-        # _bx3은 빈 공간 (우측 정렬 효과) 
+        # _bx3은 빈 공간 (우측 정렬 효과)
 
     st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
 
