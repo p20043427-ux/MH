@@ -1941,8 +1941,11 @@ def _tab_card_match() -> None:
             unsafe_allow_html=True,
         )
 
-    # ── 병원 DB 조회 (공통) ─────────────────────────────────────────
-    # 날짜 ±2일 범위 (카드사 마감일자·정산 지연 고려)
+    # ── 병원 DB 조회 — V_KIOSK_CARD_APPROVAL VIEW 전용 ─────────────
+    # [보안 원칙] RAG_READONLY 계정은 지정된 VIEW에만 SELECT 권한 부여
+    #             원본 테이블(WMACT07 등) 직접 접근 절대 금지
+    #             VIEW 조회 실패 시 → 폴백 없이 오류 안내 표시
+    # 날짜 ±2일 범위 (카드사 정산 지연·주말 고려)
     _d_from = (_dt_cm.datetime.strptime(_cm_date_str, "%Y%m%d")
                - _dt_cm.timedelta(days=2)).strftime("%Y%m%d")
     _d_to   = (_dt_cm.datetime.strptime(_cm_date_str, "%Y%m%d")
@@ -1956,9 +1959,9 @@ def _tab_card_match() -> None:
     try:
         from db.oracle_client import execute_query
 
-        # ── 1차: V_KIOSK_CARD_APPROVAL VIEW 시도 ────────────────
-        # 주의: VIEW 내 승인일시(W07ACTDAT)가 CHAR(8) YYYYMMDD 문자열
-        #       → TO_CHAR() 사용 금지 (ORA-01481), 문자열 직접 비교
+        # VIEW 경유 조회 — RAG_READONLY SELECT 권한 있는 VIEW만 사용
+        # 승인일시(W07ACTDAT)가 CHAR(8) YYYYMMDD 문자열
+        # → TO_CHAR() 사용 금지 (ORA-01481), 문자열 직접 비교
         _sql_view = f"""
             SELECT
                 승인일시                                      AS 거래일자,
@@ -1977,40 +1980,13 @@ def _tab_card_match() -> None:
             _db_ok       = True
             _db_used_sql = "V_KIOSK_CARD_APPROVAL"
     except Exception as _e1:
+        _db_ok  = False
         _db_err = str(_e1)
-
-    if not _db_ok:
-        # ── 2차 폴백: WMACT07 원본 테이블 직접 조회 ─────────────
-        # W07ACTDAT  : 수납일자 CHAR(8) YYYYMMDD
-        # W07CARDMY  : 카드 결제 금액
-        # W07APNOINFO: 승인정보 (형식: ...$XXXXXXXX... 에서 $+8자리 추출)
-        # W07STATUS  : 'KI' = 키오스크 수납
-        _sql_fallback = f"""
-            SELECT
-                W07ACTDAT                                               AS 거래일자,
-                REPLACE(
-                    REGEXP_SUBSTR(W07APNOINFO, '\\$\\d{{6,10}}', 1, 1),
-                    '$', ''
-                )                                                       AS 승인번호,
-                W07CARDMY                                              AS 승인금액,
-                ''                                                     AS 카드사명,
-                ''                                                     AS 단말기ID,
-                ''                                                     AS 설치위치
-            FROM JAIN_WM.WMACT07
-            WHERE W07ACTDAT BETWEEN '{_d_from}' AND '{_d_to}'
-              AND W07CARDMY > 0
-              AND W07STATUS = 'KI'
-              AND W07APNOINFO IS NOT NULL
-            ORDER BY W07ACTDAT
-        """
-        try:
-            _rows_fb = execute_query(_sql_fallback)
-            if _rows_fb is not None:
-                _hosp_rows   = _rows_fb
-                _db_ok       = True
-                _db_used_sql = "WMACT07 (직접조회)"
-        except Exception as _e2:
-            _db_err = f"VIEW오류: {_db_err[:60]} / 직접조회오류: {str(_e2)[:60]}"
+        logger.error(f"[CardMatch] V_KIOSK_CARD_APPROVAL 조회 실패: {_e1}")
+        # ⚠️ 원본 테이블 직접 접근 폴백 없음
+        # RAG_READONLY 계정 보안 정책상 WMACT07 등 원본 테이블 접근 금지
+        # 해결 방법: DBeaver 관리자 계정으로 V_KIOSK_CARD_APPROVAL VIEW 생성 후
+        #           RAG_READONLY에 GRANT SELECT ON JAIN_WM.V_KIOSK_CARD_APPROVAL TO RAG_READONLY
 
     # ── DB 상태 배지 ─────────────────────────────────────────────
     if _db_ok:
@@ -2020,10 +1996,14 @@ def _tab_card_match() -> None:
             f'✅ DB 연결 ({_db_used_sql} / {len(_hosp_rows):,}건)</span>'
         )
     else:
+        # VIEW 조회 실패 → 관리자 조치 안내 표시 (원본 테이블 폴백 없음)
         _db_badge = (
             f'<span style="background:{C["red"]}1A;color:{C["red"]};'
             f'border-radius:5px;padding:2px 8px;font-size:11px;font-weight:700;">'
-            f'❌ DB 조회 실패 — {_db_err[:60]}</span>'
+            f'❌ VIEW 조회 실패</span>'
+            f'<span style="font-size:10.5px;color:{C["t3"]};margin-left:6px;">'
+            f'DBeaver(관리자 계정)에서 V_KIOSK_CARD_APPROVAL VIEW 생성 후 '
+            f'GRANT SELECT ON JAIN_WM.V_KIOSK_CARD_APPROVAL TO RAG_READONLY 실행 필요</span>'
         )
 
     st.markdown(
