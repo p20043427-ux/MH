@@ -72,7 +72,6 @@ from typing import Any, Dict, List, Optional
 
 import streamlit as st
 
-# [차트 엔진 체크] Plotly 및 Pandas 가용성 확인
 try:
     import plotly.graph_objects as go
     HAS_PLOTLY = True
@@ -1671,7 +1670,7 @@ def _render_ward() -> None:
     _next_disc  = int(_first_bed.get("익일퇴원예약", 0) or 0)
 
     _total_rest    = sum(max(0, _safe_int(r.get("총병상")) - _safe_int(r.get("재원수"))) for r in bed_detail_f)
-    _total_ndc_pre = sum(_safe_int(r.get("익일퇴원예약")) for r in bed_detail_f)  # 익일가용 계산 기준
+    _total_ndc_pre = sum(_safe_int(r.get("익일퇴원예고")) for r in bed_detail_f)
 
     # ── 가동률 색상 ───────────────────────────────────────────────────
     if occ_rate >= 90:
@@ -2236,39 +2235,23 @@ def _render_ward() -> None:
 
         if chart_type_ward == "table":
             # ── 기존 풍부한 HTML 테이블 (퇴원예정, 수술, 잔여병상, 익일가용 포함) ──
-            # 헤더 공통 스타일 — white-space 제거하여 줄바꿈 허용
             _tH = (
-                "padding:7px 6px;font-size:10px;font-weight:700;"
-                "text-transform:uppercase;letter-spacing:.04em;"
+                "padding:9px 12px;font-size:11px;font-weight:700;"
+                "text-transform:uppercase;letter-spacing:.07em;"
                 "color:#64748B;border-bottom:1.5px solid #E2E8F0;"
-                "background:#F8FAFC;word-break:keep-all;line-height:1.3;"
+                "background:#F8FAFC;white-space:nowrap;"
             )
-            # 컬럼별 너비 고정 (table-layout:fixed 와 함께 사용)
-            _W = {
-                "병동":     "width:72px;",
-                "총병상":   "width:52px;",
-                "입원":     "width:44px;",
-                "재원":     "width:44px;",
-                "퇴원":     "width:44px;",
-                "금일예정": "width:58px;",   # 금일퇴원예정
-                "익일예정": "width:58px;",   # 익일퇴원예정
-                "수술":     "width:44px;",
-                "가동률":   "width:56px;",
-                "잔여":     "width:50px;",
-                "익일가용": "width:56px;",
-            }
             _th = (
-                f'<th style="{_tH}{_W["병동"]}text-align:left;">병동</th>'
-                f'<th style="{_tH}{_W["총병상"]}text-align:right;">총병상</th>'
-                f'<th style="{_tH}{_W["입원"]}text-align:right;">입원</th>'
-                f'<th style="{_tH}{_W["재원"]}text-align:right;">재원</th>'
-                f'<th style="{_tH}{_W["퇴원"]}text-align:right;">퇴원</th>'
-                f'<th style="{_tH}{_W["금일예정"]}text-align:right;color:#0284C7;">금일<br>퇴원예정</th>'
-                f'<th style="{_tH}{_W["익일예정"]}text-align:right;color:#7C3AED;">익일<br>퇴원예정</th>'
-                f'<th style="{_tH}{_W["수술"]}text-align:right;color:#8B5CF6;">수술</th>'
-                f'<th style="{_tH}{_W["가동률"]}text-align:right;">가동률</th>'
-                f'<th style="{_tH}{_W["잔여"]}text-align:right;">잔여<br>병상</th>'
-                f'<th style="{_tH}{_W["익일가용"]}text-align:right;color:#059669;">익일<br>가용</th>'
+                f'<th style="{_tH}text-align:left;">병동</th>'
+                f'<th style="{_tH}text-align:right;">총병상</th>'
+                f'<th style="{_tH}text-align:right;">입원</th>'
+                f'<th style="{_tH}text-align:right;">재원</th>'
+                f'<th style="{_tH}text-align:right;">퇴원</th>'
+                f'<th style="{_tH}text-align:right;color:#7C3AED;">퇴원예정</th>'
+                f'<th style="{_tH}text-align:right;color:#8B5CF6;">수술</th>'
+                f'<th style="{_tH}text-align:right;">가동률</th>'
+                f'<th style="{_tH}text-align:right;">잔여병상</th>'
+                f'<th style="{_tH}text-align:right;color:#059669;">익일가용</th>'
             )
             rows_html = ""
             if bed_detail_f:
@@ -2280,47 +2263,34 @@ def _render_ward() -> None:
                     disc  = _safe_int(r.get("금일퇴원"))
                     tot   = _safe_int(r.get("총병상"))
                     rest  = max(0, tot - stay)
-                    t_disc  = _safe_int(r.get("금일퇴원예고"))  # 금일퇴원예정
-                    n_disc  = _safe_int(r.get("익일퇴원예약"))  # 익일퇴원예정
+                    n_disc  = _safe_int(r.get("익일퇴원예고"))
                     n_avail = max(0, rest + n_disc)
                     r_cls = "#DC2626" if rate >= 90 else "#F59E0B" if rate >= 80 else "#059669"
-                    _td = f"padding:7px 6px;background:{bg};border-bottom:1px solid #F1F5F9;vertical-align:middle;"
-                    # 공통 숫자 셀 스타일
-                    _num = f"{_td}text-align:right;font-family:Consolas,monospace;font-size:13px;"
-                    _surg_cnt = _ward_surg.get(r.get("병동명", ""), 0)
+                    _td = f"padding:8px 12px;background:{bg};border-bottom:1px solid #F8FAFC;vertical-align:middle;"
                     rows_html += (
                         f"<tr>"
-                        # 병동명 — 진하게, 좌측정렬
-                        f'<td style="{_td}color:#0F172A;font-weight:700;font-size:13px;">{r.get("병동명", "")}</td>'
-                        # 총병상 — 회색 (변하지 않는 기준값)
-                        f'<td style="{_num}color:#94A3B8;font-weight:500;">{tot}</td>'
-                        # 금일입원 — 파랑 강조
-                        f'<td style="{_num}color:#1D4ED8;font-weight:700;">{adm}</td>'
-                        # 재원수 — 진하게 (핵심 수치)
-                        f'<td style="{_num}color:#0F172A;font-weight:700;">{stay}</td>'
-                        # 금일퇴원 — 중간 회색
-                        f'<td style="{_num}color:#475569;font-weight:500;">{disc}</td>'
-                        # 금일퇴원예정 — 청록 (오늘 확보 가능)
-                        f'<td style="{_num}color:#0284C7;font-weight:{"700" if t_disc > 0 else "400"};">{t_disc if t_disc > 0 else "─"}</td>'
-                        # 익일퇴원예정 — 보라 (내일 기준)
-                        f'<td style="{_num}color:#7C3AED;font-weight:{"700" if n_disc > 0 else "400"};">{n_disc if n_disc > 0 else "─"}</td>'
-                        # 수술 — 연보라 (있을 때만 강조)
-                        f'<td style="{_num}color:{"#7C3AED" if _surg_cnt > 0 else "#CBD5E1"};font-weight:{"700" if _surg_cnt > 0 else "400"};">{_surg_cnt if _surg_cnt > 0 else "─"}</td>'
-                        # 가동률 — 색상 분기 (위험/주의/정상)
-                        f'<td style="{_num}color:{r_cls};font-weight:700;">{rate:.1f}%</td>'
-                        # 잔여병상 — 색상 분기 (부족할수록 붉게)
-                        f'<td style="{_num}color:{"#DC2626" if rate >= 95 else "#F59E0B" if rate >= 85 else "#16A34A"};font-weight:700;">{rest}</td>'
-                        # 익일가용 — 녹색 (여유있을 때) / 회색 (없을 때)
-                        f'<td style="{_num}color:{"#059669" if n_avail > 0 else "#94A3B8"};font-weight:{"700" if n_avail > 0 else "400"};">{n_avail}</td></tr>'
+                        f'<td style="{_td}color:#0F172A;font-weight:600;">{r.get("병동명", "")}</td>'
+                        f'<td style="{_td}text-align:right;color:#64748B;font-family:Consolas,monospace;">{tot}</td>'
+                        f'<td style="{_td}text-align:right;color:{C["primary_text"]};font-family:Consolas,monospace;font-weight:700;">{adm}</td>'
+                        f'<td style="{_td}text-align:right;color:#0F172A;font-family:Consolas,monospace;font-weight:700;">{stay}</td>'
+                        f'<td style="{_td}text-align:right;color:#475569;font-family:Consolas,monospace;font-weight:600;">{disc}</td>'
+                        f'<td style="{_td}text-align:right;color:#7C3AED;font-family:Consolas,monospace;font-weight:600;">{n_disc if n_disc > 0 else "─"}</td>'
+                        f'<td style="{_td}text-align:right;font-weight:600;'
+                        f'color:{"#8B5CF6" if _ward_surg.get(r.get("병동명", ""), 0) > 0 else "#CBD5E1"};font-family:Consolas,monospace;">'
+                        f"{_ward_surg.get(r.get('병동명', ''), 0) or '─'}</td>"
+                        f'<td style="{_td}text-align:right;color:{r_cls};font-family:Consolas,monospace;font-weight:700;">{rate:.1f}%</td>'
+                        f'<td style="{_td}text-align:right;font-weight:700;'
+                        f'color:{"#EF4444" if rate >= 95 else "#F59E0B" if rate >= 85 else "#16A34A"};font-family:Consolas,monospace;">{rest}</td>'
+                        f'<td style="{_td}text-align:right;font-weight:700;'
+                        f'color:{"#059669" if n_avail > 0 else "#94A3B8"};font-family:Consolas,monospace;">{n_avail}</td></tr>'
                     )
                 _tb    = sum(_safe_int(r.get("총병상")) for r in bed_detail_f)
                 _ta    = sum(_safe_int(r.get("금일입원")) for r in bed_detail_f)
                 _ts    = sum(_safe_int(r.get("재원수")) for r in bed_detail_f)
                 _td2   = sum(_safe_int(r.get("금일퇴원")) for r in bed_detail_f)
-                _ttdc  = sum(_safe_int(r.get("금일퇴원예고")) for r in bed_detail_f)  # 금일퇴원예정 합계
-                _tndc  = sum(_safe_int(r.get("익일퇴원예약")) for r in bed_detail_f)  # 익일퇴원예정 합계
+                _tndc  = sum(_safe_int(r.get("익일퇴원예고")) for r in bed_detail_f)
                 _tr    = round(_ts / max(_tb, 1) * 100, 1)
-                _sth   = "padding:7px 6px;background:#EFF6FF;border-top:2px solid #BFDBFE;vertical-align:middle;font-weight:700;font-size:13px;font-family:Consolas,monospace;"
+                _sth   = "padding:8px 12px;background:#EFF6FF;border-top:2px solid #BFDBFE;vertical-align:middle;font-weight:700;"
                 rows_html += (
                     f"<tr>"
                     f'<td style="{_sth}color:#1E40AF;">합계</td>'
@@ -2328,7 +2298,6 @@ def _render_ward() -> None:
                     f'<td style="{_sth}text-align:right;color:{C["primary_text"]};font-family:Consolas,monospace;">{_ta}</td>'
                     f'<td style="{_sth}text-align:right;color:#0F172A;font-family:Consolas,monospace;">{_ts}</td>'
                     f'<td style="{_sth}text-align:right;color:#64748B;font-family:Consolas,monospace;">{_td2}</td>'
-                    f'<td style="{_sth}text-align:right;color:#0891B2;font-family:Consolas,monospace;">{_ttdc if _ttdc > 0 else "─"}</td>'
                     f'<td style="{_sth}text-align:right;color:#7C3AED;font-family:Consolas,monospace;">{_tndc if _tndc > 0 else "─"}</td>'
                     f'<td style="{_sth}text-align:right;color:#8B5CF6;font-family:Consolas,monospace;">{sum(_ward_surg.values()) or "─"}</td>'
                     f'<td style="{_sth}text-align:right;color:#1E40AF;font-family:Consolas,monospace;">{_tr:.1f}%</td>'
@@ -2337,7 +2306,7 @@ def _render_ward() -> None:
                 )
                 body = (
                     f'<div style="overflow-x:auto;">'
-                    f'<table style="width:100%;border-collapse:collapse;font-size:13px;table-layout:fixed;">'
+                    f'<table style="width:100%;border-collapse:collapse;font-size:13px;">'
                     f"<thead><tr>{_th}</tr></thead><tbody>{rows_html}</tbody></table></div>"
                     f'<div style="display:flex;align-items:center;justify-content:space-between;'
                     f'padding:5px 6px 0;border-top:1px solid #F1F5F9;margin-top:4px;flex-wrap:wrap;gap:4px;">'
@@ -2587,10 +2556,51 @@ def _render_ward_llm_chat(
 
     # 빠른 질문: AI 채팅 헤더 파란바로 이동됨
 
-    # ── 대화 이력 표시 ────────────────────────────────────────────────
-    for _msg in _history:
+    # ── 대화 이력 표시 (소스 카드 포함) ─────────────────────────────
+    for _hi, _msg in enumerate(_history):
         with st.chat_message(_msg["role"]):
             st.markdown(_msg["content"])
+            if _msg["role"] == "assistant" and _msg.get("sources"):
+                try:
+                    from ui.components import source_section_header, source_trust_card
+                    from pathlib import Path as _P
+                    from config.settings import settings as _cfg_h2
+                    _pdf_dirs_h = [
+                        _cfg_h2.local_work_dir,
+                        _cfg_h2.local_work_dir.parent / "docs" / "pdf",
+                        _cfg_h2.local_work_dir.parent / "docs",
+                        _cfg_h2.db_docs_dir,
+                    ]
+                    def _find_pdf_h(fname):
+                        for _dh in _pdf_dirs_h:
+                            _ph = _dh / fname
+                            if _ph.exists(): return _ph
+                            _ph2 = _dh / _P(fname).name
+                            if _ph2.exists(): return _ph2
+                        return None
+                    source_section_header(len(_msg["sources"]))
+                    for _s in _msg["sources"]:
+                        _dp_h = (_P(_s["doc_path_str"]) if _s.get("doc_path_str")
+                                 and _P(_s["doc_path_str"]).exists()
+                                 else _find_pdf_h(_s["source"]))
+                        # 히스토리: 세션 bytes 매칭
+                        _up_ch = st.session_state.get("_uploaded_pdf_bytes", {})
+                        _sk_h = _P(_s["source"]).name
+                        _bh = (_up_ch.get(_s["source"]) or _up_ch.get(_sk_h))
+                        source_trust_card(
+                            rank=_s["rank"],
+                            source=_s["source"],
+                            page=_s["page"],
+                            score=_s["score"],
+                            article=_s.get("article", ""),
+                            revision_date=_s.get("revision_date", ""),
+                            chunk_text=_s["chunk_text"],
+                            doc_path=_dp_h,
+                            card_ns=f"wh_{_hi}",
+                            pdf_bytes=_bh,
+                        )
+                except Exception:
+                    pass
 
     # ── 빠른 질문 버튼 클릭 처리 ─────────────────────────────────────
     _quick_pending = st.session_state.pop("ward_chat_quick_input", None)
@@ -2635,14 +2645,157 @@ def _render_ward_llm_chat(
                 from core.llm import get_llm_client
                 _llm    = get_llm_client()
                 _req_id = str(uuid.uuid4())[:8]
-                for _tok in _llm.generate_stream(_user_input, _safe_prompt, request_id=_req_id):
+
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # 1단계: 벡터DB에서 관련 문서 검색 (규정·지침 참조)
+                # 2단계: 검색 결과 + 대시보드 데이터를 함께 프롬프트에 주입
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                _rag_context = ""
+                _rag_sources = []
+                _pr = None
+                try:
+                    # ── 벡터DB: 모듈 수명 캐시 (_WARD_VDB) ──────────
+                    # session_state 대신 모듈 전역 → 재로드 없음, 최속
+                    import sys as _sys
+                    _this_mod = _sys.modules.get(__name__, _sys.modules.get('__main__'))
+                    _vdb_ver = st.session_state.get("dash_vdb_version", 0)
+                    _cached_ver = getattr(_this_mod, "_WARD_VDB_VER", -1)
+                    _vdb = getattr(_this_mod, "_WARD_VDB", None)
+
+                    if _vdb is None or _vdb_ver != _cached_ver:
+                        from core.vector_store import VectorStoreManager
+                        from config.settings import settings as _cfg_r
+                        _vsm = VectorStoreManager(
+                            db_path=_cfg_r.rag_db_path,
+                            model_name=_cfg_r.embedding_model,
+                            cache_dir=str(_cfg_r.local_cache_path),
+                        )
+                        _vdb = _vsm.load()
+                        setattr(_this_mod, "_WARD_VDB", _vdb)
+                        setattr(_this_mod, "_WARD_VDB_VER", _vdb_ver)
+                        if _vdb:
+                            logger.info(f"[Ward Chat] 벡터DB 로드: {_vdb.index.ntotal}벡터")
+
+                    if _vdb:
+                        # _run_fast 직접 호출: 쿼리재작성/캐시조회 오버헤드 없음
+                        from core.rag_pipeline import _run_fast
+                        _pr = _run_fast(_user_input, _vdb)
+                        if _pr and _pr.context.strip() and "찾을 수 없" not in _pr.context:
+                            _rag_context = _pr.context[:2500]
+                            _rag_sources = list(dict.fromkeys(
+                                rd.document.metadata.get("source", "")
+                                for rd in (_pr.ranked_docs or [])[:5]
+                                if rd.document.metadata.get("source")
+                            ))
+                except Exception as _rag_e:
+                    logger.warning(f"[Ward Chat] 벡터DB 검색 실패: {_rag_e}")
+
+                # 최종 프롬프트: 대시보드 데이터 + RAG 문서 합산
+                _combined_prompt = _safe_prompt
+                if _rag_context:
+                    _combined_prompt += (
+                        "\n\n## 관련 규정·지침 (벡터DB 검색 결과)\n"
+                        "아래 내용도 참고하여 더 정확한 답변을 제공하세요.\n\n"
+                        f"{_rag_context}"
+                    )
+                _combined_prompt = _combined_prompt[:6000]  # 전체 토큰 상한
+
+                for _tok in _llm.generate_stream(_user_input, _combined_prompt, request_id=_req_id):
                     _toks.append(_tok)
                     _tok_cnt += 1
-                    # 4토큰마다 또는 0.1초마다 렌더 (time.time 호출 최소화)
-                    if _tok_cnt % 4 == 0 or (time.time() - _last_render) > 0.1:
+                    if _tok_cnt % 8 == 0 or (time.time() - _last_render) > 0.08:
                         _ph.markdown("".join(_toks) + "▌")
                         _last_render = time.time()
                 _full = "".join(_toks)
+
+                # ── 참조 규정 카드 렌더 (main.py 동일 방식) ────────
+                _elapsed_ms = int((time.time() - _t_llm_start) * 1000)
+                if _pr and _pr.ranked_docs:
+                    try:
+                        from ui.components import source_section_header, source_trust_card
+                        from config.settings import settings as _cfg_s
+                        from pathlib import Path as _P
+                        source_section_header(len(_pr.ranked_docs))
+                        # PDF 탐색 경로 목록 (우선순위 순)
+                        _pdf_search_dirs = [
+                            _cfg_s.local_work_dir,
+                            _cfg_s.local_work_dir.parent / "docs" / "pdf",
+                            _cfg_s.local_work_dir.parent / "docs",
+                            _cfg_s.db_docs_dir,
+                        ]
+                        def _find_pdf(fname):
+                            """파일명으로 PDF 탐색 — glob 퍼지 포함."""
+                            _base = _P(fname).name  # 파일명만 추출
+                            for _d in _pdf_search_dirs:
+                                # 정확히 일치
+                                _p = _d / _base
+                                if _p.exists(): return _p
+                                # glob으로 유사 파일명 탐색
+                                import glob as _gl
+                                _hits = list(_gl.glob(str(_d / f"**/{_base}"), recursive=True))
+                                if _hits: return _P(_hits[0])
+                                # stem(확장자 제외)으로 탐색
+                                _stem = _P(fname).stem
+                                _hits2 = list(_gl.glob(str(_d / f"**/{_stem}*.pdf"), recursive=True))
+                                if _hits2: return _P(_hits2[0])
+                            return None
+
+                        def _get_bytes(source):
+                            """세션 캐시에서 bytes 퍼지 탐색."""
+                            _uc = st.session_state.get("_uploaded_pdf_bytes", {})
+                            if not _uc: return None
+                            # 정확히 일치
+                            _bn = _P(source).name
+                            if source in _uc: return _uc[source]
+                            if _bn in _uc: return _uc[_bn]
+                            # 퍼지: 소문자, 공백 제거 비교
+                            _norm = lambda s: s.lower().replace(" ","").replace("-","").replace("_","")
+                            for _k, _v in _uc.items():
+                                if _norm(_P(_k).name) == _norm(_bn):
+                                    return _v
+                            return None
+
+                        _up_bytes = st.session_state.get("_uploaded_pdf_bytes", {})
+                        _norm_fn = lambda s: s.lower().replace(' ','').replace('-','').replace('_','')
+                        for _doc in _pr.ranked_docs:
+                            _dp = _find_pdf(_doc.source)
+                            # 세션 bytes 퍼지 매칭
+                            _dl_fname = _P(_doc.source).name
+                            _sess_bytes = None
+                            for _uk, _uv in _up_bytes.items():
+                                if (_uk == _doc.source or
+                                    _P(_uk).name == _dl_fname or
+                                    _norm_fn(_P(_uk).name) == _norm_fn(_dl_fname)):
+                                    _sess_bytes = _uv; break
+                            # source_trust_card에 pdf_bytes 직접 전달
+                            # → 카드 내부에서 통합 렌더 (중복 버튼 없음)
+                            source_trust_card(
+                                rank=_doc.rank,
+                                source=_doc.source,
+                                page=_doc.page,
+                                score=_doc.score,
+                                article=_doc.article,
+                                revision_date=getattr(_doc, "revision_date", ""),
+                                chunk_text=_doc.document.page_content,
+                                doc_path=_dp,
+                                card_ns=f"wc_{_req_id[:6]}",
+                                pdf_bytes=_sess_bytes,  # bytes 있으면 카드 내부 버튼
+                            )
+                        # 응답시간 배지
+                        st.markdown(
+                            f'<div style="font-size:10px;color:#94A3B8;'
+                            f'text-align:right;margin-top:4px;">'
+                            f'⏱ {_elapsed_ms:,}ms</div>',
+                            unsafe_allow_html=True,
+                        )
+                    except Exception as _src_e:
+                        logger.debug(f"[Ward Chat] 소스 카드 렌더 실패: {_src_e}")
+                        # fallback: 텍스트로 출처 표시
+                        if _rag_sources:
+                            st.caption("📄 참고: " + " / ".join(_rag_sources[:3]))
+                elif _rag_sources:
+                    st.caption("📄 참고: " + " / ".join(_rag_sources[:3]))
+
             except Exception as _e:
                 _full = (
                     f"**LLM 연결 실패**\n\n"
@@ -2655,7 +2808,23 @@ def _render_ward_llm_chat(
                 logger.warning(f"[Ward Chat LLM] {_e}")
             _ph.markdown(_full)
 
-        _history.append({"role": "assistant", "content": _full})
+        # ranked_docs 직렬화해서 히스토리에 저장
+        _src_list = []
+        if _pr and _pr.ranked_docs:
+            from config.settings import settings as _cfg_h
+            for _d in _pr.ranked_docs:
+                _cp = _cfg_h.local_work_dir / _d.source
+                _src_list.append({
+                    "rank":          _d.rank,
+                    "source":         _d.source,
+                    "page":           _d.page,
+                    "score":          _d.score,
+                    "article":        _d.article,
+                    "revision_date":  getattr(_d, "revision_date", ""),
+                    "chunk_text":     _d.document.page_content,
+                    "doc_path_str":   str(_cp) if _cp.exists() else None,
+                })
+        _history.append({"role": "assistant", "content": _full, "sources": _src_list})
         st.session_state["ward_chat_history"] = _history
         _llm_elapsed = int((time.time() - _t_llm_start) * 1000) if "_t_llm_start" in dir() else 0
         _DASH_MON.log_llm_query(

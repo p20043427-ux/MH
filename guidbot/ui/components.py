@@ -368,6 +368,7 @@ def source_trust_card(
     chunk_text: str = "",
     doc_path: Optional[Path] = None,
     card_ns: str = "",
+    pdf_bytes: Optional[bytes] = None,   # 파일 없을 때 bytes로 직접 다운로드
 ) -> None:
     """
     출처 카드 v7.0 — 통합 레이아웃.
@@ -478,17 +479,23 @@ def source_trust_card(
         unsafe_allow_html=True,
     )
 
-    # PDF 다운로드 — 소형 버튼
+    # PDF 다운로드 — doc_path OR pdf_bytes 어느 쪽이든 버튼 렌더
     ns_part = f"{card_ns}_" if card_ns else ""
     uid = f"dl_{ns_part}{rank}_{abs(hash(source)) % 100000}"
-    file_ok = doc_path is not None and Path(doc_path).exists()
-    if file_ok:
+    # bytes 확보 우선순위: doc_path → 전달받은 pdf_bytes
+    _dl_data: Optional[bytes] = None
+    if doc_path is not None:
+        try: _dl_data = Path(doc_path).read_bytes()
+        except Exception: pass
+    if _dl_data is None and pdf_bytes is not None:
+        _dl_data = pdf_bytes
+    if _dl_data is not None:
+        _fname = Path(source).name  # 파일명만 사용
         try:
-            pdf_bytes = Path(doc_path).read_bytes()
             st.download_button(
-                label=f"↓ PDF 원문  ·  {source}",
-                data=pdf_bytes,
-                file_name=source,
+                label=f"↓ PDF 원문  ·  {_fname}",
+                data=_dl_data,
+                file_name=_fname,
                 mime="application/pdf",
                 key=uid,
                 use_container_width=False,
