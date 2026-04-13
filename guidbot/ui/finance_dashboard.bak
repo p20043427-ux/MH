@@ -27,6 +27,8 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 import streamlit as st
+import json as _json_r
+import uuid as _uuid_r
 
 try:
     import plotly.graph_objects as go
@@ -110,7 +112,6 @@ FQ: Dict[str, str] = {
     # V_IPD_DEPT_TREND: 진료과별 7일 입원 인원 (신규 — DDL: monthly_views_new.sql)
     "ipd_dept_trend":  "SELECT * FROM JAIN_WM.V_IPD_DEPT_TREND ORDER BY 기준일, 입원환자수 DESC",
     # V_LOS_DIST_DEPT: 진료과별 재원일수 분포 (신규 — DDL: monthly_views_new.sql)
-    # 컬럼: 진료과명 / 재원일수구간 / 환자수 / 구간순서
     "los_dist_dept":   "SELECT * FROM JAIN_WM.V_LOS_DIST_DEPT ORDER BY 진료과명, 구간순서",
 
     # ── 월간추이분석 ────────────────────────────────────────────────
@@ -120,6 +121,16 @@ FQ: Dict[str, str] = {
         "SELECT * FROM JAIN_WM.V_MONTHLY_OPD_DEPT "
         "ORDER BY 기준년월 DESC, 진료과명"
     ),
+     # ── 지역별 환자 통계 ────────────────────────────────────────────
+    # V_REGION_DEPT_MONTHLY: 진료과별 월별 지역 환자수
+    # 컬럼: 기준년월(YYYYMM) / 진료과명 / 지역(시도+시구) / 환자수
+    # DDL: region_views.sql  /  최근 24개월만 집계
+    # [보안] 지역(시구 수준)만 노출 — 상세주소/우편번호 미노출
+"region_dept_daily": (
+    "SELECT 기준일자, 진료과명, 지역, 환자수 "
+    "FROM JAIN_WM.V_REGION_DEPT_DAILY  "
+    "ORDER BY 기준일자 DESC, 진료과명, 환자수 DESC"
+),
 }
 
 # ── 기간 VIEW 쿼리 (과거 날짜 조회) ─────────────────────────────────
@@ -188,6 +199,12 @@ FQ_HIST: Dict[str, str] = {
         "SELECT * FROM JAIN_WM.V_FINANCE_TREND "
         "WHERE TO_CHAR(기준일,'YYYYMMDD') = '{d}' "
         "ORDER BY 기준일"
+    ),
+    # 날짜 지정 시: 해당 월 포함 이전 n개월 데이터
+    "region_dept_daily": (
+        "SELECT 기준일자, 진료과명, 지역, 환자수 "
+        "FROM JAIN_WM.region_dept_daily  "
+        "ORDER BY 기준일자 DESC, 진료과명, 환자수 DESC"
     ),
 }
 
@@ -345,7 +362,7 @@ _PLOTLY_LAYOUT = dict(
 
 
 # ════════════════════════════════════════════════════════════════════
-# 탭 1 — 실시간 현황
+# 탭 1 — 실시간 현황  (기존 코드 그대로 유지)
 # ════════════════════════════════════════════════════════════════════
 def _tab_realtime(opd_kpi, dept_status, kiosk_status, discharge_pipe, bed_detail,
                   kiosk_by_dept=None, kiosk_counter_trend=None, ward_room_detail=None,
@@ -639,7 +656,7 @@ def _tab_realtime(opd_kpi, dept_status, kiosk_status, discharge_pipe, bed_detail
 
 
 # ════════════════════════════════════════════════════════════════════
-# 탭 2 (수납·미수금) — _tab_revenue
+# 탭 2 — 수납·미수금  (기존 _tab_revenue 그대로)
 # ════════════════════════════════════════════════════════════════════
 def _tab_revenue(finance_today, finance_trend, finance_by_dept, overdue_stat):
     _tot_amt = sum(int(r.get("금액",0) or 0) for r in finance_today)
@@ -781,12 +798,17 @@ def _tab_revenue(finance_today, finance_trend, finance_by_dept, overdue_stat):
 
 
 # ════════════════════════════════════════════════════════════════════
-# 탭 3 (기존 탭2) — 주간추이분석  v2.3
+# 탭 3 (기존 탭2) — 주간추이분석  v2.3 전면 재설계
 #
 # [구성]
+#   배너   : 실시간현황과 명시적 분리
 #   섹션1  : 📈 7일간 추이  (외래·입원·퇴원·재원 라인)
 #   섹션2  : 🗓️ 외래 히트맵 [좌 1/2] | 🗓️ 입원 히트맵 [우 1/2]
 #   섹션3  : 🛏️ 진료과별 재원일수 분포 (스택 바 + DRG 경고)
+#
+# [삭제]
+#   ⏱️ 대기시간 추세 (V_WAITTIME_TREND)
+#   📈 진료과별 외래 추세 라인 + 진료과 선택기
 # ════════════════════════════════════════════════════════════════════
 def _tab_analytics(
     opd_dept_trend: List[Dict],
@@ -814,9 +836,9 @@ def _tab_analytics(
         unsafe_allow_html=True,
     )
 
-    # ════════════════════════
+    # ════════════════════
     # [1] 📈 7일간 추이
-    # ════════════════════════
+    # ════════════════════
     _gap()
     st.markdown('<div class="wd-card" style="border-top:3px solid ' + C["blue"] + ';">', unsafe_allow_html=True)
     _sec_hd("📈 7일간 추이", "외래·입원·퇴원·재원 일별 전체 합계", C["blue"])
@@ -860,7 +882,11 @@ def _tab_analytics(
     # [2] 히트맵 2분할 — 외래 [1/2] | 입원 [1/2]
     # ═══════════════════════════════════════
     def _render_heatmap(data, value_col, title, sub, color, colorscale, chart_key):
-        """진료과×날짜 히트맵 공통 렌더러."""
+        """
+        진료과×날짜 히트맵 공통 렌더러.
+        data      : Oracle VIEW 조회 결과 (list of dict)
+        value_col : 수치 컬럼명 ("외래환자수" / "입원환자수")
+        """
         st.markdown(f'<div class="wd-card" style="border-top:3px solid {color};">', unsafe_allow_html=True)
         _sec_hd(title, sub, color)
         if data and HAS_PLOTLY:
@@ -891,12 +917,7 @@ def _tab_analytics(
                 _plotly_empty()
         else:
             _view_name = "V_OPD_DEPT_TREND" if "외래" in title else "V_IPD_DEPT_TREND"
-            st.markdown(
-                f'<div style="padding:32px;text-align:center;color:#94A3B8;font-size:13px;">'
-                f'데이터 없음 — {_view_name} 확인<br>'
-                f'<span style="font-size:11px;">DDL: monthly_views_new.sql</span></div>',
-                unsafe_allow_html=True,
-            )
+            st.markdown(f'<div style="padding:32px;text-align:center;color:#94A3B8;font-size:13px;">데이터 없음 — {_view_name} 확인<br><span style="font-size:11px;">DDL: monthly_views_new.sql</span></div>', unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     c_opd, c_ipd = st.columns([1,1], gap="small")
@@ -918,106 +939,60 @@ def _tab_analytics(
         )
     _gap()
 
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════
     # [3] 🛏️ 진료과별 재원일수 분포 (스택 바)
-    #
-    # [데이터] V_LOS_DIST_DEPT
-    #   컬럼: 진료과명 / 재원일수구간 / 환자수 / 구간순서
-    #
-    # [렌더링]
-    #   · 구간순서로 bins 정렬
-    #   · 진료과별 총 환자수 내림차순 정렬
-    #   · 구간별 색상: 초록(단기) → 노랑(중기) → 빨강(장기)
-    #   · barmode="stack" → 구간 누적 막대
-    #   · DRG 임계(15일+) 경고 배너
-    # ═══════════════════════════════════════════════════════════
+    # ═════════════════════════════════════
     st.markdown('<div class="wd-card" style="border-top:3px solid ' + C["violet"] + ';">', unsafe_allow_html=True)
     _sec_hd("🛏️ 진료과별 재원일수 분포", "현재 재원 환자 기준 · 진료과 × 재원일수 구간", C["violet"])
-
     if los_dist_dept and HAS_PLOTLY:
-        # ── Step 1: 구간 순서 정렬 (구간순서 컬럼 기준, 없으면 999)
+        # 구간 정렬 (구간순서 컬럼 기준)
         _bins_ordered: list = []
         _seen_bins: set = set()
-        for _r in sorted(los_dist_dept, key=lambda x: int(x.get("구간순서") or 999)):
-            _b = str(_r.get("재원일수구간","") or "").strip()
+        for _r in sorted(los_dist_dept, key=lambda x: int(x.get("구간순서",99))):
+            _b = _r.get("재원일수구간","")
             if _b and _b not in _seen_bins:
-                _bins_ordered.append(_b)
-                _seen_bins.add(_b)
+                _bins_ordered.append(_b); _seen_bins.add(_b)
 
-        # ── Step 2: 진료과 정렬 (총 환자수 내림차순)
+        # 진료과 정렬 (총 환자수 내림차순)
         _dept_total: dict = _ddc(int)
         for _r in los_dist_dept:
-            _dn = str(_r.get("진료과명","") or "").strip()
-            if _dn:
-                _dept_total[_dn] += int(_r.get("환자수", 0) or 0)
-        _depts_los = sorted(
-            [d for d in _dept_total if d],
-            key=lambda d: -_dept_total[d],
-        )
+            _dept_total[_r.get("진료과명","")] += int(_r.get("환자수",0) or 0)
+        _depts_los = sorted([d for d in _dept_total if d], key=lambda d: -_dept_total[d])
 
-        # ── Step 3: (진료과, 구간) → 환자수 매핑
-        _los_map = {}
-        for _r in los_dist_dept:
-            _dn = str(_r.get("진료과명","") or "").strip()
-            _b  = str(_r.get("재원일수구간","") or "").strip()
-            if _dn and _b:
-                _los_map[(_dn, _b)] = _los_map.get((_dn, _b), 0) + int(_r.get("환자수", 0) or 0)
-
-        # ── Step 4: 구간별 색상 (짧은 재원 = 안전색, 긴 재원 = 위험색)
-        _bin_colors = [C["green"], C["teal"], C["blue"], C["yellow"], C["red"]]
-
-        # ── Step 5: 구간별 Bar trace 생성
+        _los_map = {
+            (r.get("진료과명",""), r.get("재원일수구간","")): int(r.get("환자수",0) or 0)
+            for r in los_dist_dept
+        }
+        _bin_colors = [C["green"],C["teal"],C["blue"],C["yellow"],C["red"]]
         _fig_los = go.Figure()
         for _i, _bin in enumerate(_bins_ordered):
-            _y_vals = [_los_map.get((dept, _bin), 0) for dept in _depts_los]
+            _y_vals = [_los_map.get((dept,_bin),0) for dept in _depts_los]
             _fig_los.add_trace(go.Bar(
-                name=_bin,
-                x=_depts_los,
-                y=_y_vals,
-                marker_color=_bin_colors[_i % len(_bin_colors)],
-                marker=dict(line=dict(color="#fff", width=0.5)),
-                text=[str(v) if v > 0 else "" for v in _y_vals],
-                textposition="inside",
-                textfont=dict(size=9, color="#fff"),
+                name=_bin, x=_depts_los, y=_y_vals,
+                marker_color=_bin_colors[_i%len(_bin_colors)],
+                marker=dict(line=dict(color="#fff",width=0.5)),
+                text=[str(v) if v>0 else "" for v in _y_vals],
+                textposition="inside", textfont=dict(size=9,color="#fff"),
                 hovertemplate=f"<b>%{{x}}</b><br>{_bin}: %{{y}}명<extra></extra>",
             ))
-
-        # ── Step 6: 레이아웃
-        _fig_los.update_layout(
-            **_PLOTLY_LAYOUT,
-            barmode="stack",
-            height=320,
-            margin=dict(l=0, r=0, t=8, b=50),
-            legend=dict(
-                orientation="h", y=-0.20, x=0.5, xanchor="center",
-                font=dict(size=11), bgcolor="rgba(0,0,0,0)",
-            ),
-        )
-        _fig_los.update_xaxes(
-            tickangle=-35,
-            tickfont=dict(size=10),
-            gridcolor="rgba(0,0,0,0)",
-        )
-        _fig_los.update_yaxes(
-            title_text="환자 수(명)",
-            title_font=dict(size=10, color=C["t3"]),
-        )
+        _fig_los.update_layout(**_PLOTLY_LAYOUT, barmode="stack", height=320,
+            margin=dict(l=0,r=0,t=8,b=50),
+            legend=dict(orientation="h",y=-0.20,x=0.5,xanchor="center",
+                        font=dict(size=11),bgcolor="rgba(0,0,0,0)"))
+        _fig_los.update_xaxes(tickangle=-35, tickfont=dict(size=10), gridcolor="rgba(0,0,0,0)")
+        _fig_los.update_yaxes(title_text="환자 수(명)", title_font=dict(size=10,color=C["t3"]))
         st.plotly_chart(_fig_los, use_container_width=True, key="an_los_dept_bar")
 
-        # ── Step 7: DRG 임계 경고 (15일+ 또는 30일+ 포함 구간)
-        _drg_bins = {b for b in _bins_ordered if any(k in b for k in ("15", "30", "60"))}
+        # DRG 임계 경고
+        _drg_bins = {b for b in _bins_ordered if any(k in b for k in ("15","30","60"))}
         _drg_by_dept: dict = _ddc(int)
         for _r in los_dist_dept:
-            _dn = str(_r.get("진료과명","") or "").strip()
-            _b  = str(_r.get("재원일수구간","") or "").strip()
-            if _b in _drg_bins and _dn:
-                _drg_by_dept[_dn] += int(_r.get("환자수", 0) or 0)
+            if _r.get("재원일수구간","") in _drg_bins:
+                _drg_by_dept[_r.get("진료과명","")] += int(_r.get("환자수",0) or 0)
         _drg_total = sum(_drg_by_dept.values())
         if _drg_total > 0:
-            _top3     = sorted(_drg_by_dept.items(), key=lambda x: -x[1])[:3]
-            _top3_str = "  |  ".join(
-                f'<b style="color:{C["red"]};">{d}</b> {n}명' for d, n in _top3
-            )
+            _top3     = sorted(_drg_by_dept.items(), key=lambda x:-x[1])[:3]
+            _top3_str = "  |  ".join(f'<b style="color:{C["red"]};">{d}</b> {n}명' for d,n in _top3)
             st.markdown(
                 f'<div style="background:{C["red_l"]};border:1px solid #FECDD3;border-radius:8px;'
                 f'padding:9px 14px;margin-top:6px;display:flex;align-items:center;gap:10px;">'
@@ -1038,11 +1013,22 @@ def _tab_analytics(
 
 # ════════════════════════════════════════════════════════════════════
 # 탭 4 (신규) — 월간추이분석
+#
+# [구성]
+#   배너   : 월간 분석 설명
+#   컨트롤 : 기준월 / 비교월 선택 (selectbox)
+#   테이블 : 진료과 × [기준월: 방문자수/신환/신환%/외래전체/구환] × [비교월: 동일] × 비고(신환증감)
+#   차트   : 진료과별 신환자수 그룹 바
+#
+# [필요 VIEW]
+#   V_MONTHLY_OPD_DEPT (신규 — DDL: monthly_views_new.sql)
+#   컬럼: 기준년월(YYYYMM) / 진료과명 / 방문자수 / 신환자수 / 구환자수 / 외래전체 / 기타건수
 # ════════════════════════════════════════════════════════════════════
 def _tab_monthly(monthly_opd_dept: List[Dict]) -> None:
     monthly_opd_dept = monthly_opd_dept or []
 
     _gap()
+    # 분리 배너
     st.markdown(
         f'<div style="background:linear-gradient(90deg,{C["green"]}15,{C["teal"]}10);'
         f'border-left:4px solid {C["green"]};border-radius:0 8px 8px 0;'
@@ -1055,6 +1041,7 @@ def _tab_monthly(monthly_opd_dept: List[Dict]) -> None:
         unsafe_allow_html=True,
     )
 
+    # VIEW 없음 안내
     if not monthly_opd_dept:
         st.markdown(
             f'<div style="background:#FFFBEB;border:1px solid #FDE68A;border-radius:10px;'
@@ -1069,9 +1056,9 @@ def _tab_monthly(monthly_opd_dept: List[Dict]) -> None:
         )
         return
 
+    # 가용 월 목록 (내림차순)
     _avail = sorted(
-        {str(r.get("기준년월",""))[:6] for r in monthly_opd_dept
-         if str(r.get("기준년월",""))[:6].isdigit()},
+        {str(r.get("기준년월",""))[:6] for r in monthly_opd_dept if str(r.get("기준년월",""))[:6].isdigit()},
         reverse=True,
     )
     if len(_avail) < 2:
@@ -1081,24 +1068,29 @@ def _tab_monthly(monthly_opd_dept: List[Dict]) -> None:
     def _fmt_ym(ym: str) -> str:
         return f"{ym[:4]}년 {ym[4:6]}월" if len(ym) >= 6 else ym
 
+    # 월 선택 컨트롤
     _ctrl1, _ctrl2, _ctrl_spacer = st.columns([2, 2, 6], gap="small")
     with _ctrl1:
         st.markdown(f'<div style="font-size:11px;font-weight:700;color:{C["t2"]};padding-bottom:2px;">📅 기준월</div>', unsafe_allow_html=True)
         _m1 = st.selectbox("기준월", options=_avail, index=min(1, len(_avail)-1),
                            key="mon_m1", label_visibility="collapsed",
-                           format_func=_fmt_ym, help="분석 기준이 되는 월")
+                           format_func=_fmt_ym,
+                           help="분석 기준이 되는 월")
     with _ctrl2:
         st.markdown(f'<div style="font-size:11px;font-weight:700;color:{C["t2"]};padding-bottom:2px;">📅 비교월</div>', unsafe_allow_html=True)
         _m2 = st.selectbox("비교월", options=_avail, index=0,
                            key="mon_m2", label_visibility="collapsed",
-                           format_func=_fmt_ym, help="기준월과 비교할 월")
+                           format_func=_fmt_ym,
+                           help="기준월과 비교할 월 (전월 또는 동기 선택)")
 
     _m1_label = _fmt_ym(_m1)
     _m2_label = _fmt_ym(_m2)
 
+    # 데이터 분리
     _d1 = {r.get("진료과명",""): r for r in monthly_opd_dept if str(r.get("기준년월",""))[:6] == _m1}
     _d2 = {r.get("진료과명",""): r for r in monthly_opd_dept if str(r.get("기준년월",""))[:6] == _m2}
 
+    # 진료과 목록 (합집합, 총 방문자수 내림차순)
     _all_depts_raw = sorted(set(list(_d1.keys()) + list(_d2.keys())))
     _dept_visit    = {d: int(_d2.get(d, _d1.get(d,{})).get("방문자수",0) or 0) for d in _all_depts_raw}
     _all_depts     = [d for d in sorted(_all_depts_raw, key=lambda d:-_dept_visit[d]) if d]
@@ -1106,11 +1098,13 @@ def _tab_monthly(monthly_opd_dept: List[Dict]) -> None:
     def _vi(r, key): return int(r.get(key, 0) or 0)
     def _pct(n, d):  return f"{round(n/d*100,1):.1f}%" if d > 0 else "─"
 
-    # ── 비교 테이블
+    # ── 비교 테이블 ───────────────────────────────────────────────
     st.markdown('<div class="wd-card" style="border-top:3px solid ' + C["green"] + ';margin-top:8px;">', unsafe_allow_html=True)
     _sec_hd("📊 2개월 진료과별 외래 인원 비교", f"{_m1_label} vs {_m2_label}", C["green"])
 
     _TH = "padding:5px 8px;font-size:10.5px;font-weight:700;color:#64748B;border-bottom:2px solid #E2E8F0;background:#F8FAFC;white-space:nowrap;"
+
+    # 그룹 헤더 (1행)
     _h1 = (
         f'<th style="{_TH}text-align:left;" rowspan="2">구분</th>'
         f'<th colspan="5" style="{_TH}text-align:center;color:{C["blue"]};border-left:3px solid {C["blue"]}33;">'
@@ -1120,12 +1114,13 @@ def _tab_monthly(monthly_opd_dept: List[Dict]) -> None:
         f'<th style="{_TH}text-align:center;color:{C["red"]};" rowspan="2">'
         f'비고<br><span style="font-size:9px;font-weight:400;">전월대비 신환증감</span></th>'
     )
+    # 서브 헤더 (2행)
     _sub_cols = [
-        ("방문자수",    C["t2"],    False),
-        ("신환(첫방문)", C["green"], True),
-        ("신환%",       C["green"], False),
-        ("외래전체",    C["blue"],  False),
-        ("구환자수",    C["t3"],    False),
+        ("방문자수",   C["t2"],    False),
+        ("신환(첫방문)",C["green"], True),
+        ("신환%",      C["green"], False),
+        ("외래전체",   C["blue"],  False),
+        ("구환자수",   C["t3"],    False),
     ]
     _h2 = ""
     for _grp_color in [C["blue"], C["indigo"]]:
@@ -1134,6 +1129,7 @@ def _tab_monthly(monthly_opd_dept: List[Dict]) -> None:
             _fw = "font-weight:800;" if _bold else ""
             _h2 += f'<th style="{_TH}text-align:right;color:{_col_c};{_bl}{_fw}">{_col_label}</th>'
 
+    # 행 생성
     _rows = ""
     for _i, _dept in enumerate(_all_depts):
         _r1 = _d1.get(_dept, {}); _r2 = _d2.get(_dept, {})
@@ -1154,20 +1150,24 @@ def _tab_monthly(monthly_opd_dept: List[Dict]) -> None:
         _rows += (
             f"<tr>"
             f'<td style="{_tdl}">{_dept}</td>'
+            # 기준월
             f'<td style="{_td}border-left:3px solid {C["blue"]}33;">{_v1:,}</td>'
             f'<td style="{_td}color:{C["green"]};font-weight:700;">{_s1:,}</td>'
             f'<td style="{_td}color:{C["green"]};">{_pct(_s1,_e1)}</td>'
             f'<td style="{_td}">{_e1:,}</td>'
             f'<td style="{_td}">{_g1:,}</td>'
+            # 비교월
             f'<td style="{_td}border-left:3px solid {C["indigo"]}33;">{_v2:,}</td>'
             f'<td style="{_td}color:{C["indigo"]};font-weight:700;">{_s2:,}</td>'
             f'<td style="{_td}color:{C["indigo"]};">{_pct(_s2,_e2)}</td>'
             f'<td style="{_td}">{_e2:,}</td>'
             f'<td style="{_td}">{_g2:,}</td>'
+            # 비고
             f'<td style="{_td}text-align:center;font-weight:700;color:{_diff_c};">{_diff_str}</td>'
             f"</tr>"
         )
 
+    # 합계 행
     def _sum_all(d_dict):
         return {k: sum(int(r.get(k,0) or 0) for r in d_dict.values())
                 for k in ("방문자수","신환자수","구환자수","외래전체")}
@@ -1203,6 +1203,8 @@ def _tab_monthly(monthly_opd_dept: List[Dict]) -> None:
         f'<tbody>{_rows}</tbody></table></div>',
         unsafe_allow_html=True,
     )
+
+    # 범례
     st.markdown(
         f'<div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;padding-top:6px;border-top:1px solid #F1F5F9;font-size:10.5px;">'
         f'<span style="color:{C["green"]};font-weight:700;">🟢 신환(첫방문): 해당 월 처음 내원 환자</span>'
@@ -1233,6 +1235,7 @@ def _tab_monthly(monthly_opd_dept: List[Dict]) -> None:
             marker_color=C["indigo_l"], marker=dict(line=dict(color=C["indigo"],width=0.5)),
             hovertemplate=f"<b>%{{x}}</b><br>{_m2_label}: %{{y:,}}명<extra></extra>",
         ))
+        # 증감 스캐터 오버레이
         _diff_vals = [_s2_vals[i] - _s1_vals[i] for i in range(len(_all_depts))]
         _diff_text = [f"{'▲' if v>0 else '▼' if v<0 else ''}{abs(v)}" if v!=0 else "" for v in _diff_vals]
         _diff_c2   = [C["red"] if v>0 else C["blue"] if v<0 else "rgba(0,0,0,0)" for v in _diff_vals]
@@ -1253,7 +1256,7 @@ def _tab_monthly(monthly_opd_dept: List[Dict]) -> None:
 
 
 # ════════════════════════════════════════════════════════════════════
-# AI 채팅 분석
+# AI 채팅 분석  (기존 그대로)
 # ════════════════════════════════════════════════════════════════════
 def _render_finance_llm_chat(bed_detail=None, dept_status=None, kiosk_by_dept=None,
                               daily_dept_stat=None, kiosk_counter_trend=None,
@@ -1287,30 +1290,20 @@ def _render_finance_llm_chat(bed_detail=None, dept_status=None, kiosk_by_dept=No
     for _r in discharge_pipe:
         _s = _r.get("단계",""); _n = int(_r.get("환자수",0) or 0)
         if _s: _pipe[_s] = _pipe.get(_s,0) + _n
-    _kc_summary = [
-        {"날짜":str(r.get("기준일",""))[:10],"키오스크":r.get("키오스크건수"),"창구":r.get("창구건수")}
-        for r in kiosk_counter_trend[-7:]
-    ]
+    _kc_summary = [{"날짜":str(r.get("기준일",""))[:10],"키오스크":r.get("키오스크건수"),"창구":r.get("창구건수")}
+                   for r in kiosk_counter_trend[-7:]]
     _ctx = {
         "기준시각": time.strftime("%Y-%m-%d %H:%M"),
-        "병동_현황": {
-            "금일입원":_adm,"금일퇴원":_disc,"재원수":_stay,"총병상":_total_bed,
-            "잔여병상":_rest,"가동률":f"{_occ}%","익일퇴원예정":_ndc,
-            "병동별":[{"병동":r.get("병동명"),"재원":r.get("재원수"),"가동률":r.get("가동률")} for r in bed_detail[:12]],
-        },
-        "외래_현황": {
-            "대기":_wait,"진료중":_proc,"완료":_done,"합계":_wait+_proc+_done,
-            "진료과별":[
-                {"진료과":r.get("진료과명"),"대기":r.get("대기"),"완료":r.get("완료"),"평균대기(분)":r.get("평균대기시간")}
-                for r in sorted(dept_status, key=lambda x:-int(x.get("대기",0) or 0))[:12]
-            ],
-        },
+        "병동_현황": {"금일입원":_adm,"금일퇴원":_disc,"재원수":_stay,"총병상":_total_bed,
+                      "잔여병상":_rest,"가동률":f"{_occ}%","익일퇴원예정":_ndc,
+                      "병동별":[{"병동":r.get("병동명"),"재원":r.get("재원수"),"가동률":r.get("가동률")} for r in bed_detail[:12]]},
+        "외래_현황": {"대기":_wait,"진료중":_proc,"완료":_done,"합계":_wait+_proc+_done,
+                      "진료과별":[{"진료과":r.get("진료과명"),"대기":r.get("대기"),"완료":r.get("완료"),"평균대기(분)":r.get("평균대기시간")}
+                                  for r in sorted(dept_status,key=lambda x:-int(x.get("대기",0) or 0))[:12]]},
         "일일현황_보험구분": {cat: dict(v) for cat,v in _ds_cat.items()},
-        "키오스크_수납": {
-            "총건수":_k_tot,"총금액(만원)":_k_amt//10000,
-            "진료과별":[{"진료과":r.get("진료과명"),"건수":r.get("수납건수"),"금액(만원)":int(r.get("수납금액",0) or 0)//10000} for r in kiosk_by_dept[:10]],
-            "7일_추세":_kc_summary,
-        },
+        "키오스크_수납": {"총건수":_k_tot,"총금액(만원)":_k_amt//10000,
+                          "진료과별":[{"진료과":r.get("진료과명"),"건수":r.get("수납건수"),"금액(만원)":int(r.get("수납금액",0) or 0)//10000} for r in kiosk_by_dept[:10]],
+                          "7일_추세":_kc_summary},
         "퇴원_파이프라인": _pipe,
     }
     _sys_prompt = (
@@ -1325,7 +1318,7 @@ def _render_finance_llm_chat(bed_detail=None, dept_status=None, kiosk_by_dept=No
         st.session_state["fn_chat_history"] = []
     _history = st.session_state["fn_chat_history"]
     st.markdown(
-        '<div style="background:#FFFFFF;border:1px solid #E2E8F0;border-radius:12px;padding:14px 16px;margin-top:4px;">',
+        f'<div style="background:#FFFFFF;border:1px solid #E2E8F0;border-radius:12px;padding:14px 16px;margin-top:4px;">',
         unsafe_allow_html=True,
     )
     st.markdown(
@@ -1363,10 +1356,8 @@ def _render_finance_llm_chat(bed_detail=None, dept_status=None, kiosk_by_dept=No
                     if len(_toks)%4==0: _ph.markdown("".join(_toks)+"▌")
                 _full = "".join(_toks)
             except Exception as _e:
-                _full = (
-                    f"**LLM 연결 실패**\n\n`{_e}`\n\n"
-                    f"현재 데이터: 재원 **{_stay}명** / 외래대기 **{_wait}명** / 키오스크수납 **{_k_tot}건**"
-                )
+                _full = (f"**LLM 연결 실패**\n\n`{_e}`\n\n"
+                         f"현재 데이터: 재원 **{_stay}명** / 외래대기 **{_wait}명** / 키오스크수납 **{_k_tot}건**")
             _ph.markdown(_full)
         _history.append({"role":"assistant","content":_full})
         st.session_state["fn_chat_history"] = _history; st.rerun()
@@ -1374,7 +1365,7 @@ def _render_finance_llm_chat(bed_detail=None, dept_status=None, kiosk_by_dept=No
 
 
 # ════════════════════════════════════════════════════════════════════
-# 세부과 일일집계표
+# 세부과 일일집계표  (기존 그대로)
 # ════════════════════════════════════════════════════════════════════
 def _render_day_inweon(day_inweon: list) -> None:
     _TH = ("padding:6px 8px;font-size:11px;font-weight:700;"
@@ -1460,9 +1451,1375 @@ def _render_day_inweon(day_inweon: list) -> None:
         st.markdown('<div style="padding:28px;text-align:center;color:#94A3B8;font-size:13px;">V_DAY_INWEON_3 데이터 없음</div>', unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
+# ════════════════════════════════════════════════════════════════════
+# 지역 지도 시각화 헬퍼
+# ════════════════════════════════════════════════════════════════════
+@st.cache_data(ttl=86400, show_spinner=False)
+def _load_sigungu_geojson() -> Optional[dict]:
+    """
+    한국 시군구 GeoJSON 로드 (southkorea-maps, 2018 기준).
+    하루 1회 캐시 — 병원 내부망에서 GitHub 접근 불가 시 None 반환.
+    """
+    try:
+        import requests as _req
+        _url = (
+            "https://raw.githubusercontent.com/southkorea/"
+            "southkorea-maps/master/kostat/2018/json/sigungu.geojson"
+        )
+        _r = _req.get(_url, timeout=8)
+        _r.raise_for_status()
+        return _r.json()
+    except Exception:
+        return None
+
+
+def _render_sido_bar(sido_total: dict, color: str, chart_key: str) -> None:
+    """GeoJSON 로드 실패 시 수평 바 차트 폴백."""
+    if not sido_total or not HAS_PLOTLY:
+        _plotly_empty()
+        return
+    _sorted = sorted(sido_total.items(), key=lambda x: -x[1])
+    _fig = go.Figure(go.Bar(
+        x=[v for _, v in _sorted],
+        y=[k for k, _ in _sorted],
+        orientation="h",
+        marker_color=color,
+        marker=dict(opacity=0.8, line=dict(color="#fff", width=0.5)),
+        text=[f"{v:,}명" for _, v in _sorted],
+        textposition="outside",
+        hovertemplate="<b>%{y}</b><br>%{x:,}명<extra></extra>",
+    ))
+    _fig.update_layout(
+        **_PLOTLY_LAYOUT,
+        height=max(300, len(_sorted) * 24 + 60),
+        margin=dict(l=0, r=80, t=4, b=4),
+        showlegend=False, bargap=0.3,
+    )
+    _fig.update_xaxes(showticklabels=False, showgrid=False)
+    _fig.update_yaxes(autorange="reversed", tickfont=dict(size=10))
+    st.plotly_chart(_fig, use_container_width=True, key=chart_key)
+
+
+def _render_geo_map(
+    region_data: list,
+    sido_prefix: str,       # "부산" / "경남"
+    sig_cd_prefix: str,     # "26"=부산 / "48"=경남
+    title: str,
+    color: str,
+    chart_key: str,
+    zoom: float = 9.0,
+    center_lat: float = 35.18,
+    center_lon: float = 129.07,
+) -> None:
+    """
+    시도별 구군 환자수 지도 시각화.
+
+    [데이터 흐름]
+    region_data → 지역 컬럼 파싱 (예: "부산 해운대구" → "해운대구")
+    → GeoJSON SIG_KOR_NM 매핑 → Plotly choropleth_mapbox
+
+    [폴백]
+    GeoJSON 로드 실패(내부망 등) → 수평 바 차트로 자동 대체
+    """
+    from collections import defaultdict as _ddm
+
+    st.markdown(
+        f'<div class="wd-card" style="border-top:3px solid {color};">',
+        unsafe_allow_html=True,
+    )
+    _sec_hd(title, "환자 주소지 기준 · 구군별 밀도", color)
+
+    # ── 해당 시도 데이터 집계
+    _sido_cnt: dict = _ddm(int)
+    for _r in region_data:
+        # ── 해당 시도 집계 (마지막 토큰 매칭)
+    # "광역시 부산진구" / "부산 해운대구" / "경남 창원시" 등
+    # prefix 형식 무관하게 마지막 공백 이후 구군명만 추출
+        _registered_ids = {f["id"] for f in geojson["features"]}
+        _cnt: dict = _ddm(int)
+        for _r in region_data:
+            _rg  = str(_r.get("지역", "") or "").strip()
+            _val = int(_r.get("환자수", 0) or 0)
+            if not _rg:
+                continue
+            _gu = _rg.rsplit(" ", 1)[-1]   # 마지막 토큰 = 구군명
+            if _gu in _registered_ids:
+                _cnt[_gu] += _val
+
+    if not _sido_cnt:
+        st.markdown(
+            f'<div style="padding:24px;text-align:center;color:#94A3B8;font-size:13px;">'
+            f'{sido_prefix} 지역 데이터 없음<br>'
+            f'<span style="font-size:11px;">지역 컬럼 형식 예시: "{sido_prefix} 해운대구"</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    if not HAS_PLOTLY:
+        _plotly_empty()
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    # ── GeoJSON 로드
+    _geojson = _load_sigungu_geojson()
+
+    if _geojson:
+        # 해당 시도 feature만 필터
+        _features = [
+            f for f in _geojson.get("features", [])
+            if str(f.get("properties", {}).get("SIG_CD", "")).startswith(sig_cd_prefix)
+        ]
+
+        if _features:
+            import plotly.express as px
+
+            # 구군명 → 환자수 행 생성
+            _rows = []
+            for _f in _features:
+                _nm  = _f["properties"].get("SIG_KOR_NM", "")
+                _cnt = _sido_cnt.get(_nm, 0)
+                _rows.append({
+                    "구군":   _nm,
+                    "환자수": _cnt,
+                    "SIG_CD": _f["properties"]["SIG_CD"],
+                })
+
+            _mini_geojson = {"type": "FeatureCollection", "features": _features}
+
+            _fig_map = px.choropleth_mapbox(
+                _rows,
+                geojson=_mini_geojson,
+                locations="SIG_CD",
+                featureidkey="properties.SIG_CD",
+                color="환자수",
+                hover_name="구군",
+                hover_data={"환자수": ":,d", "SIG_CD": False},
+                color_continuous_scale=[
+                    [0.0, "#F0F9FF"],
+                    [0.2, "#BAE6FD"],
+                    [0.5, "#0EA5E9"],
+                    [0.8, "#1D4ED8"],
+                    [1.0, "#0F172A"],
+                ],
+                mapbox_style="open-street-map",   # API 키 불필요
+                zoom=zoom,
+                center={"lat": center_lat, "lon": center_lon},
+                opacity=0.65,
+                labels={"환자수": "환자수(명)"},
+            )
+            _fig_map.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)",
+                margin=dict(l=0, r=0, t=4, b=0),
+                height=400,
+                coloraxis_colorbar=dict(
+                    title="환자수",
+                    thickness=12,
+                    len=0.75,
+                    tickformat=",",
+                    titlefont=dict(size=11),
+                    tickfont=dict(size=10),
+                ),
+            )
+            st.plotly_chart(_fig_map, use_container_width=True, key=chart_key)
+
+            # ── 구군 순위 보조표 (TOP10)
+            _sorted_sido = sorted(_sido_cnt.items(), key=lambda x: -x[1])
+            _max_v = _sorted_sido[0][1] if _sorted_sido else 1
+            _bar_html = (
+                '<div style="display:flex;flex-wrap:wrap;gap:4px 16px;'
+                'margin-top:10px;padding-top:8px;border-top:1px solid #F1F5F9;">'
+            )
+            for _i, (_gn, _gc) in enumerate(_sorted_sido[:10]):
+                _pct_g = round(_gc / max(_max_v, 1) * 100)
+                _medal = ["🥇","🥈","🥉"] if _i < 3 else ["","","","④","⑤","⑥","⑦","⑧","⑨","⑩"]
+                _md    = _medal[_i] if _i < len(_medal) else ""
+                _bar_html += (
+                    f'<div style="display:flex;align-items:center;gap:6px;'
+                    f'min-width:200px;flex:1;">'
+                    f'<span style="font-size:13px;">{_md}</span>'
+                    f'<div style="width:60px;font-size:11px;font-weight:600;'
+                    f'color:#334155;white-space:nowrap;overflow:hidden;">{_gn}</div>'
+                    f'<div style="flex:1;height:10px;background:#F1F5F9;'
+                    f'border-radius:3px;overflow:hidden;min-width:40px;">'
+                    f'<div style="width:{_pct_g}%;height:100%;background:{color};'
+                    f'border-radius:3px;opacity:0.85;"></div></div>'
+                    f'<div style="width:50px;font-size:11px;font-family:Consolas;'
+                    f'font-weight:700;color:{color};text-align:right;">{_gc:,}</div>'
+                    f'</div>'
+                )
+            _bar_html += "</div>"
+            st.markdown(_bar_html, unsafe_allow_html=True)
+
+        else:
+            # feature 없음 → 바 차트
+            _render_sido_bar(_sido_cnt, color, chart_key)
+
+    else:
+        # GeoJSON 로드 실패 (내부망 등)
+        st.markdown(
+            f'<div style="background:#FFFBEB;border:1px solid #FDE68A;border-radius:6px;'
+            f'padding:7px 12px;margin-bottom:8px;font-size:11px;color:#92400E;">'
+            f'⚠️ 지도 데이터 로드 실패 (GitHub 접근 불가) — 막대 차트로 대체합니다'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        _render_sido_bar(_sido_cnt, color, chart_key)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════
+# 부산/경남 구군 중심 좌표 — 내장 데이터 (외부 요청 없음)
+# ═══════════════════════════════════════════════════════════════════
+_BUSAN_COORDS: Dict[str, tuple] = {
+    "중구":    (35.1040, 129.0327),
+    "서구":    (35.0975, 129.0232),
+    "동구":    (35.1369, 129.0614),
+    "영도구":  (35.0912, 129.0678),
+    "부산진구":(35.1629, 129.0531),
+    "동래구":  (35.1985, 129.0846),
+    "남구":    (35.1363, 129.0847),
+    "북구":    (35.1978, 128.9902),
+    "해운대구":(35.1631, 129.1636),
+    "사하구":  (35.1044, 128.9745),
+    "금정구":  (35.2429, 129.0920),
+    "강서구":  (35.2094, 128.9806),
+    "연제구":  (35.1762, 129.0811),
+    "수영구":  (35.1454, 129.1131),
+    "사상구":  (35.1521, 128.9921),
+    "기장군":  (35.2444, 129.2219),
+}
+
+_GYEONGNAM_COORDS: Dict[str, tuple] = {
+    "창원시":  (35.2284, 128.6811),
+    "진주시":  (35.1800, 128.1076),
+    "통영시":  (34.8544, 128.4333),
+    "사천시":  (35.0038, 128.0644),
+    "김해시":  (35.2286, 128.8891),
+    "밀양시":  (35.5036, 128.7460),
+    "거제시":  (34.8804, 128.6212),
+    "양산시":  (35.3351, 129.0374),
+    "의령군":  (35.3220, 128.2617),
+    "함안군":  (35.2726, 128.4065),
+    "창녕군":  (35.5446, 128.4924),
+    "고성군":  (34.9740, 128.3228),
+    "남해군":  (34.8378, 127.8921),
+    "하동군":  (35.0673, 127.7513),
+    "산청군":  (35.4160, 127.8734),
+    "함양군":  (35.5205, 127.7255),
+    "거창군":  (35.6868, 127.9096),
+    "합천군":  (35.5668, 128.1659),
+}
+
+
+def _render_bubble_map(
+    region_data: list,
+    sido_prefix: str,
+    coord_map: Dict[str, tuple],
+    title: str,
+    color_main: str,
+    chart_key: str,
+    zoom: float,
+    center_lat: float,
+    center_lon: float,
+) -> None:
+    """
+    버블맵 시각화 — GeoJSON 없이 구군 중심 좌표만으로 동작.
+
+    Parameters
+    ----------
+    region_data  : _filtered_data (진료과·기간 필터 완료된 리스트)
+    sido_prefix  : "부산" / "경남" 등 지역 컬럼 앞에 붙는 시도명
+    coord_map    : {구군명: (lat, lon)} 딕셔너리
+    title        : 카드 섹션 제목
+    color_main   : 메인 색상 hex
+    chart_key    : st.plotly_chart 고유 key
+    zoom         : 지도 초기 줌 레벨
+    center_lat/lon : 지도 중심 좌표
+    """
+    from collections import defaultdict as _ddm
+
+    st.markdown(
+        f'<div class="wd-card" style="border-top:3px solid {color_main};">',
+        unsafe_allow_html=True,
+    )
+    _sec_hd(title, "환자 주소지 기준 · 버블 크기 = 환자수", color_main)
+
+    if not HAS_PLOTLY:
+        _plotly_empty()
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    # ── 해당 시도 데이터 집계
+    _cnt: dict = _ddm(int)
+    for _r in region_data:
+        _rg  = str(_r.get("지역", "") or "")
+        _val = int(_r.get("환자수", 0) or 0)
+        if _rg.startswith(sido_prefix):
+            _gu = _rg[len(sido_prefix):].strip()
+            if _gu:
+                _cnt[_gu] += _val
+
+    if not _cnt:
+        st.markdown(
+            f'<div style="padding:24px;text-align:center;color:#94A3B8;font-size:13px;">'
+            f'{sido_prefix} 지역 데이터 없음<br>'
+            f'<span style="font-size:11px;">지역 컬럼 예시: "{sido_prefix} 해운대구"</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    _max_cnt = max(_cnt.values()) if _cnt else 1
+
+    # ── 좌표 매핑
+    _lats, _lons, _names, _cnts = [], [], [], []
+    for _gu, (_lat, _lon) in coord_map.items():
+        _lats.append(_lat)
+        _lons.append(_lon)
+        _names.append(_gu)
+        _cnts.append(_cnt.get(_gu, 0))
+
+    # 버블 크기 (환자수 비례, 최소 8 최대 52)
+    _sizes = [max(8, min(52, 8 + 44 * (c / max(_max_cnt, 1)))) for c in _cnts]
+
+    _fig = go.Figure()
+
+    # ① 배경 원 (구군 위치 가이드)
+    _fig.add_trace(go.Scattermapbox(
+        lat=_lats, lon=_lons,
+        mode="markers",
+        marker=dict(size=[max(5, s * 0.35) for s in _sizes], color="#CBD5E1", opacity=0.4),
+        hoverinfo="skip",
+        showlegend=False,
+    ))
+
+    # ② 메인 버블 (환자수 색상 스케일)
+    _fig.add_trace(go.Scattermapbox(
+        lat=_lats, lon=_lons,
+        mode="markers+text",
+        marker=dict(
+            size=_sizes,
+            color=_cnts,
+            colorscale=[
+                [0.0,  "#EFF6FF"],
+                [0.15, "#BFDBFE"],
+                [0.40, "#60A5FA"],
+                [0.70, "#2563EB"],
+                [1.0,  "#1E3A8A"],
+            ],
+            cmin=0,
+            cmax=_max_cnt,
+            opacity=0.80,
+            colorbar=dict(
+                title=dict(text="환자수", font=dict(size=10)),
+                thickness=12,
+                len=0.72,
+                tickformat=",",
+                tickfont=dict(size=9),
+            ),
+            showscale=True,
+        ),
+        text=_names,
+        textposition="middle center",
+        textfont=dict(size=8, color="#0F172A"),
+        customdata=_cnts,
+        hovertemplate="<b>%{text}</b><br>환자수: %{customdata:,}명<extra></extra>",
+        showlegend=False,
+    ))
+
+    _fig.update_layout(
+        mapbox=dict(
+            style="open-street-map",   # Mapbox API 키 불필요
+            zoom=zoom,
+            center=dict(lat=center_lat, lon=center_lon),
+        ),
+        paper_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=0, r=0, t=4, b=0),
+        height=420,
+    )
+    st.plotly_chart(_fig, use_container_width=True, key=chart_key)
+
+    # ── 구군 순위 보조 테이블 (TOP 10)
+    _sorted_cnt = sorted(_cnt.items(), key=lambda x: -x[1])
+    _medals = ["🥇", "🥈", "🥉"]
+    _bar_html = (
+        '<div style="display:flex;flex-wrap:wrap;gap:5px 18px;'
+        'margin-top:10px;padding-top:8px;border-top:1px solid #F1F5F9;">'
+    )
+    for _i, (_gn, _gc) in enumerate(_sorted_cnt[:10]):
+        _pct_g = round(_gc / max(_max_cnt, 1) * 100)
+        _md = _medals[_i] if _i < 3 else f'<span style="font-size:10px;color:#94A3B8;font-weight:700;">{_i+1}</span>'
+        _bar_html += (
+            f'<div style="display:flex;align-items:center;gap:5px;'
+            f'min-width:188px;flex:1 0 188px;">'
+            f'<div style="width:22px;text-align:center;font-size:12px;">{_md}</div>'
+            f'<div style="width:54px;font-size:11px;font-weight:600;color:#334155;'
+            f'white-space:nowrap;overflow:hidden;">{_gn}</div>'
+            f'<div style="flex:1;height:8px;background:#F1F5F9;border-radius:4px;overflow:hidden;">'
+            f'<div style="width:{_pct_g}%;height:100%;background:{color_main};'
+            f'border-radius:4px;opacity:0.75;"></div></div>'
+            f'<div style="width:46px;font-size:11px;font-family:Consolas;'
+            f'font-weight:700;color:{color_main};text-align:right;">{_gc:,}</div>'
+            f'</div>'
+        )
+    # 좌표 미등록 구군 표시
+    _unknown = {k: v for k, v in _cnt.items() if k not in _registered_ids and v > 0}
+    if _unknown:
+        _unk_str = " / ".join(
+            f"{k} {v:,}명" for k, v in sorted(_unknown.items(), key=lambda x: -x[1])[:6]
+        )
+        _bar_html += (
+            f'<div style="width:100%;margin-top:6px;font-size:10.5px;color:#94A3B8;">'
+            f'📌 지도 미표시: {_unk_str}</div>'
+        )
+    _bar_html += "</div>"
+    st.markdown(_bar_html, unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 부산/경남 격자 지도 (Tile Grid Map)
+# ─ GeoJSON/인터넷 불필요, go.Heatmap 기반
+# ─ 각 구군을 격자 셀로 배치, 색상 강도 = 환자수
+# ═══════════════════════════════════════════════════════════════════
+
+# ── 부산 16개 구군 격자 위치 (col, row) ─────────────────────────────
+# row 높을수록 북쪽, col 높을수록 동쪽
+_BUSAN_GRID: Dict[str, tuple] = {
+    "영도구":   (3, 0),                                             # 섬 (남)
+    "사하구":   (1, 1), "서구":   (2, 1), "중구":    (3, 1),       # 남부
+    "동구":     (4, 1), "남구":   (5, 1),
+    "강서구":   (0, 2), "사상구": (1, 2), "부산진구":(3, 2),       # 중부
+    "연제구":   (4, 2), "수영구": (5, 2),
+    "북구":     (1, 3), "동래구": (4, 3), "해운대구":(5, 3),       # 북부
+    "금정구":   (3, 4), "기장군": (5, 4),                          # 최북
+}
+
+# ── 경상남도 18개 시군 격자 위치 ─────────────────────────────────────
+_GYEONGNAM_GRID: Dict[str, tuple] = {
+    # row 4 (북)
+    "거창군":   (1, 4), "합천군": (3, 4), "창녕군": (5, 4), "밀양시":   (7, 4),
+    # row 3
+    "함양군":   (0, 3), "의령군": (2, 3), "함안군": (4, 3),
+    "창원시":   (5, 3), "김해시": (6, 3), "양산시": (8, 3),
+    # row 2
+    "산청군":   (0, 2), "진주시": (2, 2), "고성군": (4, 2), "거제시":   (6, 2),
+    # row 1 (남)
+    "하동군":   (0, 1), "사천시": (1, 1), "남해군": (2, 1), "통영시":   (4, 1),
+}
+
+
+def _render_tile_grid(
+    region_data: list,
+    sido_prefix: str,
+    grid_dict: Dict[str, tuple],
+    title: str,
+    color_main: str,
+    colorscale: list,
+    chart_key: str,
+) -> None:
+    """
+    격자 단계구분도 렌더러.
+
+    [원리]
+    - 각 구군을 (col, row) 격자 좌표에 배치
+    - go.Heatmap 으로 색상 강도 시각화
+    - NaN 셀 = 투명 (빈 격자)
+    - 완전 오프라인, GeoJSON 불필요
+
+    Parameters
+    ----------
+    region_data  : _filtered_data (진료과·기간 필터 완료)
+    sido_prefix  : "부산" / "경남" (지역 컬럼 앞 시도명, 미사용 — rsplit 매칭)
+    grid_dict    : {구군명: (col, row)} 격자 위치 딕셔너리
+    title        : 카드 제목
+    color_main   : 강조 색상 hex
+    colorscale   : plotly colorscale list
+    chart_key    : plotly_chart unique key
+    """
+    from collections import defaultdict as _ddm
+    import math
+
+    st.markdown(
+        f'<div class="wd-card" style="border-top:3px solid {color_main};">',
+        unsafe_allow_html=True,
+    )
+    _sec_hd(title, "격자 지도 — 셀 색상 강도 = 환자수 (지리적 방향 유지)", color_main)
+
+    if not HAS_PLOTLY:
+        _plotly_empty()
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    # ── 집계: 마지막 토큰(구군명) 매칭
+    _cnt: dict = _ddm(int)
+    for _r in region_data:
+        _rg  = str(_r.get("지역", "") or "").strip()
+        _val = int(_r.get("환자수", 0) or 0)
+        if not _rg:
+            continue
+        _gu = _rg.rsplit(" ", 1)[-1]   # "광역시 해운대구" → "해운대구"
+        if _gu in grid_dict:
+            _cnt[_gu] += _val
+
+    if not _cnt:
+        st.markdown(
+            f'<div style="padding:24px;text-align:center;color:#94A3B8;font-size:13px;">'
+            f'데이터 없음 — 지역 컬럼 마지막 토큰이 구군명과 일치해야 합니다</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    # ── 격자 Z 행렬 구성
+    _max_col = max(c for c, r in grid_dict.values())
+    _max_row = max(r for c, r in grid_dict.values())
+
+    # float('nan') = 빈 셀 (투명)
+    _z    = [[float("nan")] * (_max_col + 1) for _ in range(_max_row + 1)]
+    _text = [[""] * (_max_col + 1) for _ in range(_max_row + 1)]
+
+    for _nm, (_col, _row) in grid_dict.items():
+        _c = _cnt.get(_nm, 0)
+        _z[_row][_col]    = float(_c)
+        _text[_row][_col] = f"{_nm}<br>{_c:,}명"
+
+    # NaN 셀 → 0으로 처리하되 텍스트는 비워두기
+    # (colorscale 에서 0 = 가장 연한 색 → 빈 셀처럼 보임)
+    # 실제로 NaN은 투명하게 처리됨
+
+    _max_v = max(_cnt.values()) if _cnt else 1
+
+    _fig = go.Figure(go.Heatmap(
+        z=_z,
+        text=_text,
+        texttemplate="%{text}",
+        textfont=dict(size=9, color="#1E293B"),
+        colorscale=colorscale,
+        zmin=0,
+        zmax=_max_v,
+        showscale=True,
+        hovertemplate="%{text}<extra></extra>",
+        xgap=4,
+        ygap=4,
+        colorbar=dict(
+            title=dict(text="환자수", font=dict(size=11)),
+            thickness=13,
+            len=0.75,
+            tickformat=",",
+            tickfont=dict(size=10),
+        ),
+    ))
+
+    _fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=350,
+        margin=dict(l=0, r=0, t=4, b=0),
+        xaxis=dict(visible=False, showgrid=False, zeroline=False),
+        yaxis=dict(visible=False, showgrid=False, zeroline=False, autorange="reversed"),
+    )
+
+    st.plotly_chart(_fig, use_container_width=True, key=chart_key)
+
+    # ── 구군 순위 보조 바 (TOP 12)
+    _sorted_cnt = sorted(_cnt.items(), key=lambda x: -x[1])
+    _max_bar    = _sorted_cnt[0][1] if _sorted_cnt else 1
+    _medals     = ["🥇", "🥈", "🥉"]
+    _bar_html   = (
+        '<div style="display:flex;flex-wrap:wrap;gap:5px 16px;'
+        'margin-top:8px;padding-top:8px;border-top:1px solid #F1F5F9;">'
+    )
+    for _i, (_gn, _gc) in enumerate(_sorted_cnt[:12]):
+        _pct_b = round(_gc / max(_max_bar, 1) * 100)
+        _md = _medals[_i] if _i < 3 else (
+            f'<span style="font-size:10px;color:#94A3B8;font-weight:700;">{_i+1}</span>'
+        )
+        _bar_html += (
+            f'<div style="display:flex;align-items:center;gap:5px;'
+            f'min-width:186px;flex:1 0 186px;">'
+            f'<div style="width:22px;text-align:center;">{_md}</div>'
+            f'<div style="width:52px;font-size:11px;font-weight:600;color:#334155;'
+            f'white-space:nowrap;">{_gn}</div>'
+            f'<div style="flex:1;height:8px;background:#F1F5F9;border-radius:4px;overflow:hidden;">'
+            f'<div style="width:{_pct_b}%;height:100%;background:{color_main};'
+            f'border-radius:4px;opacity:0.78;"></div></div>'
+            f'<div style="width:44px;font-size:11px;font-family:Consolas;'
+            f'font-weight:700;color:{color_main};text-align:right;">{_gc:,}</div>'
+            f'</div>'
+        )
+    _bar_html += "</div>"
+    st.markdown(_bar_html, unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+def _tab_region(region_data: List[Dict]) -> None:
+    """
+    지역별 환자 통계 탭 v3.
+ 
+    [변경 사항]
+      · 기간  : 1주일(7일) / 2주일(14일) / 한달(30일)
+      · 진료과: 필수 선택 (전체 제거 — 쿼리 부하 방지)
+      · 차트  : 일별 트렌드 라인 + 지역×날짜 히트맵
+      · 미선택: 진료과 목록 + 환자수 순위 안내 화면
+ 
+    [VIEW]  V_REGION_DEPT_DAILY
+    [컬럼]  기준일자(YYYYMMDD) / 진료과명 / 지역 / 환자수
+    """
+    import datetime as _dt_r
+    from collections import defaultdict as _ddr
+ 
+    region_data = region_data or []
+ 
+    # ── 배너
+    _gap()
+    st.markdown(
+        f'<div style="background:linear-gradient(90deg,{C["teal"]}15,{C["green"]}10);'
+        f'border-left:4px solid {C["teal"]};border-radius:0 8px 8px 0;'
+        f'padding:10px 16px;margin-bottom:6px;display:flex;align-items:center;gap:10px;">'
+        f'<span style="font-size:18px;">📍</span>'
+        f'<div><div style="font-size:13px;font-weight:700;color:{C["teal"]};">'
+        f'지역별 환자 통계 · 경영 분석</div>'
+        f'<div style="font-size:11px;color:{C["t3"]};margin-top:1px;">'
+        f'진료과별 환자 주소지 분포 · 일별 지역 유입 추이 · AI 경영 인사이트</div>'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+ 
+    # ── VIEW 없음 안내
+    if not region_data:
+        st.markdown(
+            f'<div style="background:#FFFBEB;border:1px solid #FDE68A;border-radius:10px;'
+            f'padding:24px;text-align:center;margin-top:12px;">'
+            f'<div style="font-size:32px;margin-bottom:8px;">📋</div>'
+            f'<div style="font-size:14px;font-weight:700;color:#92400E;">'
+            f'V_REGION_DEPT_DAILY 데이터 없음</div>'
+            f'<div style="font-size:12px;color:#B45309;margin-top:6px;line-height:1.8;">'
+            f'<b>region_views_daily.sql</b> 을 DBeaver(DBA 계정)에서 실행 후 재시작<br>'
+            f'컬럼: 기준일자(YYYYMMDD) / 진료과명 / 지역 / 환자수'
+            f'</div></div>',
+            unsafe_allow_html=True,
+        )
+        return
+ 
+    # ── 진료과 목록 구성 (총 환자수 내림차순)
+    _dept_total: dict = _ddr(int)
+    for _r in region_data:
+        _dp  = _r.get("진료과명", "")
+        _cnt = int(_r.get("환자수", 0) or 0)
+        if _dp:
+            _dept_total[_dp] += _cnt
+    _all_depts = sorted(_dept_total.keys(), key=lambda d: -_dept_total[d])
+ 
+    # ── 오늘 날짜 기준
+    _today      = _dt_r.date.today()
+    _today_str  = _today.strftime("%Y%m%d")
+ 
+    # ──────────────────────────────────────────────
+    # [컨트롤] 진료과 선택(필수) + 기간 선택
+    # ──────────────────────────────────────────────
+    _PERIOD_MAP = {"최근 1주일": 7, "최근 2주일": 14, "최근 한달": 30}
+ 
+    _c1, _c2, _c_sp = st.columns([3, 3, 6], gap="small")
+    with _c1:
+        st.markdown(
+            f'<div style="font-size:11px;font-weight:700;color:{C["t2"]};padding-bottom:2px;">'
+            f'🏥 진료과 선택 <span style="color:{C["red"]};">*</span></div>',
+            unsafe_allow_html=True,
+        )
+        # placeholder 옵션으로 미선택 상태 구현
+        _dept_options = ["── 진료과를 선택하세요 ──"] + _all_depts
+        _sel_dept = st.selectbox(
+            "진료과", options=_dept_options, index=0,
+            key="reg_dept_v3", label_visibility="collapsed",
+            help="분석할 진료과를 선택하세요",
+        )
+    with _c2:
+        st.markdown(
+            f'<div style="font-size:11px;font-weight:700;color:{C["t2"]};padding-bottom:2px;">'
+            f'📅 분석 기간</div>',
+            unsafe_allow_html=True,
+        )
+        _period_label = st.selectbox(
+            "기간", options=list(_PERIOD_MAP.keys()), index=0,
+            key="reg_period_v3", label_visibility="collapsed",
+        )
+    _n_days    = _PERIOD_MAP[_period_label]
+    _cutoff    = (_today - _dt_r.timedelta(days=_n_days)).strftime("%Y%m%d")
+ 
+    # ── 미선택 상태 → 진료과 목록 안내
+    _is_dept_selected = _sel_dept != "── 진료과를 선택하세요 ──"
+ 
+    if not _is_dept_selected:
+        _gap()
+        st.markdown(
+            f'<div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:10px;'
+            f'padding:16px 20px;text-align:center;margin-bottom:12px;">'
+            f'<div style="font-size:14px;font-weight:700;color:{C["blue"]};margin-bottom:4px;">'
+            f'👆 위에서 진료과를 선택하면 분석이 시작됩니다</div>'
+            f'<div style="font-size:11px;color:{C["t3"]};">'
+            f'최근 30일 기준 / 쿼리 부하 방지를 위해 개별 진료과 조회만 지원</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+ 
+        # ── 진료과 환자수 순위 요약 (전체 30일 기준)
+        st.markdown(
+            f'<div class="wd-card" style="border-top:3px solid {C["blue"]};">',
+            unsafe_allow_html=True,
+        )
+        _sec_hd("🏥 진료과별 환자수 순위", "최근 30일 전체 기준 — 선택 진료과 참고용", C["blue"])
+        _TH_D = (
+            "padding:6px 10px;font-size:11px;font-weight:700;color:#64748B;"
+            "border-bottom:1.5px solid #E2E8F0;background:#F8FAFC;"
+        )
+        _dept_table = (
+            '<table style="width:100%;border-collapse:collapse;font-size:12.5px;">'
+            f'<thead><tr>'
+            f'<th style="{_TH_D}text-align:center;width:40px;">순위</th>'
+            f'<th style="{_TH_D}text-align:left;">진료과</th>'
+            f'<th style="{_TH_D}text-align:right;color:{C["blue"]};">환자수(30일)</th>'
+            f'<th style="{_TH_D}">비율</th>'
+            f'</tr></thead><tbody>'
+        )
+        _total_all = sum(_dept_total.values()) or 1
+        for _ri, _dp in enumerate(_all_depts[:20], 1):
+            _dc = _dept_total.get(_dp, 0)
+            _dp_pct = round(_dc / _total_all * 100, 1)
+            _rbg    = "#F8FAFC" if _ri % 2 == 0 else "#FFFFFF"
+            _td_s   = f"padding:6px 10px;background:{_rbg};border-bottom:1px solid #F1F5F9;font-size:12px;"
+            _dept_table += (
+                f"<tr>"
+                f'<td style="{_td_s}text-align:center;font-weight:700;color:{C["t3"]};">{_ri}</td>'
+                f'<td style="{_td_s}font-weight:600;color:{C["t1"]};">{_dp}</td>'
+                f'<td style="{_td_s}text-align:right;font-family:Consolas;color:{C["blue"]};font-weight:700;">{_dc:,}</td>'
+                f'<td style="{_td_s}"><div style="display:flex;align-items:center;gap:6px;">'
+                f'<div style="flex:1;height:6px;background:#F1F5F9;border-radius:3px;overflow:hidden;">'
+                f'<div style="width:{_dp_pct}%;height:100%;background:{C["blue"]};border-radius:3px;"></div>'
+                f'</div><span style="font-size:10px;color:{C["t3"]};min-width:34px;">{_dp_pct}%</span>'
+                f'</div></td>'
+                f"</tr>"
+            )
+        st.markdown(_dept_table + "</tbody></table>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+        return  # ← 미선택 시 이후 분석 렌더링 중단
+ 
+    # ════════════════════════════════════════════════════════════════
+    # 이하: 진료과 선택 완료 상태
+    # ════════════════════════════════════════════════════════════════
+ 
+    # ── 기간 및 진료과 필터
+    _filtered_data = [
+        _r for _r in region_data
+        if _r.get("진료과명", "") == _sel_dept
+        and str(_r.get("기준일자", "")) >= _cutoff
+        and str(_r.get("기준일자", "")) <= _today_str
+    ]
+ 
+    # ── 지역 집계 (지역미상 분리)
+    _region_total: dict = _ddr(int)
+    _unknown_total: int = 0
+    for _r in _filtered_data:
+        _rg  = _r.get("지역", "")
+        _cnt = int(_r.get("환자수", 0) or 0)
+        if _rg in ("지역미상", "", None):
+            _unknown_total += _cnt
+        else:
+            _region_total[_rg] += _cnt
+ 
+    _total_patients  = sum(_region_total.values()) + _unknown_total
+    _known_total     = sum(_region_total.values())
+    _unique_regions  = len(_region_total)
+    _sorted_regions  = sorted(_region_total.items(), key=lambda x: -x[1])
+    _top1_region     = _sorted_regions[0][0] if _sorted_regions else "─"
+    _top1_cnt        = _sorted_regions[0][1] if _sorted_regions else 0
+    _top1_dependency = round(_top1_cnt / max(_known_total, 1) * 100, 1)
+ 
+    # ── KPI 4개
+    _gap()
+    _dep_color = C["red"] if _top1_dependency >= 60 else C["yellow"] if _top1_dependency >= 40 else C["green"]
+    _kk1, _kk2, _kk3, _kk4 = st.columns(4, gap="small")
+    _kpi_card(_kk1, "👥", f"총 환자수 ({_period_label})",
+              f"{_total_patients:,}", "명",
+              f"지역미상 {_unknown_total:,}명 포함", C["teal"])
+    _kpi_card(_kk2, "📍", "유입 지역 수",
+              f"{_unique_regions:,}", "개 시구", "지역미상 제외 기준", C["green"])
+    _kk3.markdown(
+        f'<div class="fn-kpi" style="border-top:3px solid {_dep_color};">'
+        f'<div class="fn-kpi-icon">🏆</div>'
+        f'<div class="fn-kpi-label">1위 지역</div>'
+        f'<div style="font-size:15px;font-weight:800;color:{_dep_color};line-height:1.3;margin:2px 0;">'
+        f'{_top1_region[:10] if len(_top1_region) > 10 else _top1_region}</div>'
+        f'<div style="font-size:11px;color:{C["t3"]};">{_top1_cnt:,}명</div>'
+        f'<div class="goal-bar-wrap"><div class="goal-bar-fill" '
+        f'style="width:{_top1_dependency}%;background:{_dep_color};"></div></div>'
+        f'<div style="font-size:10px;color:{_dep_color};font-weight:700;">'
+        f'점유율 {_top1_dependency}% '
+        f'{"⚠️ 의존도 높음" if _top1_dependency >= 60 else "주의" if _top1_dependency >= 40 else "✅ 양호"}'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+    _kpi_card(_kk4, "📅", "분석 기간",
+              _period_label.replace("최근 ",""), "",
+              f"{_cutoff[:4]}.{_cutoff[4:6]}.{_cutoff[6:]} ~ 오늘", C["indigo"])
+    _gap()
+ 
+    # ── 지역미상 경고
+    if _unknown_total > 0:
+        _unk_pct = round(_unknown_total / max(_total_patients, 1) * 100, 1)
+        _unk_c   = C["red"] if _unk_pct >= 20 else C["yellow"]
+        st.markdown(
+            f'<div style="background:{_unk_c}18;border:1px solid {_unk_c}55;border-radius:8px;'
+            f'padding:8px 14px;margin-bottom:8px;display:flex;align-items:center;gap:10px;">'
+            f'<span>⚠️</span>'
+            f'<span style="font-size:12px;font-weight:700;color:{_unk_c};">'
+            f'지역미상 {_unknown_total:,}명 ({_unk_pct}%) — 우편번호 미기재 또는 POSTNO 미매핑</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+ 
+    # ══════════════════════════════════════
+    # [섹션1] 좌: 지역 수평 바 TOP15  |  우: 일별 트렌드 라인
+    # ══════════════════════════════════════
+    _col_bar, _col_line = st.columns([1, 1], gap="small")
+ 
+    with _col_bar:
+        st.markdown(
+            f'<div class="wd-card" style="border-top:3px solid {C["blue"]};">',
+            unsafe_allow_html=True,
+        )
+        _sec_hd(f"📊 {_sel_dept} — 지역별 환자 순위 TOP15",
+                f"{_period_label} 합산", C["blue"])
+        if _sorted_regions and HAS_PLOTLY:
+            _top15     = _sorted_regions[:15]
+            _rg_lbls   = [r for r, _ in _top15]
+            _rg_vals   = [v for _, v in _top15]
+            _max_v     = _rg_vals[0] if _rg_vals else 1
+            _bar_clrs  = [
+                f"rgba(8,145,178,{0.30 + 0.70 * (v / _max_v):.2f})"
+                for v in _rg_vals
+            ]
+            _fig_bar = go.Figure(go.Bar(
+                x=_rg_vals, y=_rg_lbls,
+                orientation="h",
+                marker=dict(color=_bar_clrs, line=dict(color=C["teal"], width=0.5)),
+                text=[f"{v:,}명 ({round(v/max(_known_total,1)*100,1)}%)" for v in _rg_vals],
+                textposition="outside",
+                textfont=dict(size=10, color=C["t2"]),
+                hovertemplate="<b>%{y}</b><br>%{x:,}명<extra></extra>",
+            ))
+            _fig_bar.update_layout(
+                **_PLOTLY_LAYOUT,
+                height=max(300, len(_top15) * 26 + 60),
+                margin=dict(l=0, r=100, t=8, b=8),
+                showlegend=False, bargap=0.3,
+            )
+            _fig_bar.update_xaxes(showticklabels=False, showgrid=False)
+            _fig_bar.update_yaxes(tickfont=dict(size=10), autorange="reversed")
+            st.plotly_chart(_fig_bar, use_container_width=True, key="reg_v3_hbar")
+        else:
+            _plotly_empty()
+        st.markdown("</div>", unsafe_allow_html=True)
+ 
+    with _col_line:
+        st.markdown(
+            f'<div class="wd-card" style="border-top:3px solid {C["green"]};">',
+            unsafe_allow_html=True,
+        )
+        _sec_hd(f"📈 {_sel_dept} — 상위 5개 지역 일별 추이",
+                f"{_period_label} 일별 환자수", C["green"])
+        # 일별 × 지역 집계
+        _day_rg_map: dict = _ddr(lambda: _ddr(int))
+        for _r in _filtered_data:
+            _dj  = str(_r.get("기준일자", ""))
+            _rg  = _r.get("지역", "")
+            _cnt = int(_r.get("환자수", 0) or 0)
+            if _dj and _rg not in ("지역미상", "", None):
+                _day_rg_map[_dj][_rg] += _cnt
+ 
+        _all_days_sorted = sorted(_day_rg_map.keys())
+        _top5_rg         = [r for r, _ in _sorted_regions[:5]]
+ 
+        # 날짜 레이블: 간략하게 (MM/DD)
+        def _fmt_day(d: str) -> str:
+            return f"{d[4:6]}/{d[6:8]}" if len(d) == 8 else d
+ 
+        if _top5_rg and _all_days_sorted and HAS_PLOTLY:
+            _fig_line = go.Figure()
+            for _li, _rg_l in enumerate(_top5_rg):
+                _y_vals = [_day_rg_map.get(_dj, {}).get(_rg_l, 0) for _dj in _all_days_sorted]
+                _fig_line.add_trace(go.Scatter(
+                    x=[_fmt_day(_dj) for _dj in _all_days_sorted],
+                    y=_y_vals, name=_rg_l,
+                    mode="lines+markers",
+                    line=dict(color=_PALETTE[_li % len(_PALETTE)], width=2.5),
+                    marker=dict(size=6, color=_PALETTE[_li % len(_PALETTE)],
+                                line=dict(color="#fff", width=1.5)),
+                    hovertemplate=f"<b>{_rg_l}</b><br>%{{x}}: %{{y:,}}명<extra></extra>",
+                ))
+            _fig_line.update_layout(
+                **_PLOTLY_LAYOUT, height=300,
+                margin=dict(l=0, r=0, t=30, b=8),
+                legend=dict(orientation="h", y=1.12, x=0.5, xanchor="center",
+                            font=dict(size=10), bgcolor="rgba(0,0,0,0)"),
+                hovermode="x unified",
+            )
+            _fig_line.update_xaxes(tickfont=dict(size=10),
+                                   tickangle=-30 if _n_days >= 14 else 0)
+            _fig_line.update_yaxes(title_text="환자수(명)",
+                                   title_font=dict(size=10, color=C["t3"]))
+            st.plotly_chart(_fig_line, use_container_width=True, key="reg_v3_line")
+        else:
+            _plotly_empty()
+        st.markdown("</div>", unsafe_allow_html=True)
+ 
+    _gap()
+ 
+    # ══════════════════════════════════════
+    # [섹션2] 지역×날짜 히트맵 (2주일/한달일 때만 표시)
+    # ══════════════════════════════════════
+    _top10_rg_hm = [r for r, _ in _sorted_regions[:10]]
+    if _n_days >= 14 and _top10_rg_hm and _all_days_sorted and HAS_PLOTLY:
+        st.markdown(
+            f'<div class="wd-card" style="border-top:3px solid {C["indigo"]};">',
+            unsafe_allow_html=True,
+        )
+        _sec_hd(f"🗓️ {_sel_dept} — 지역 × 날짜 히트맵",
+                f"상위 10개 지역 · {_period_label}", C["indigo"])
+        _hm_map2 = {
+            (_rg, _dj): _day_rg_map.get(_dj, {}).get(_rg, 0)
+            for _rg in _top10_rg_hm
+            for _dj in _all_days_sorted
+        }
+        _z_hm2 = [
+            [_hm_map2.get((_rg, _dj), 0) for _dj in _all_days_sorted]
+            for _rg in _top10_rg_hm
+        ]
+        _x_lbl2 = [_fmt_day(_dj) for _dj in _all_days_sorted]
+        _fig_hm3 = go.Figure(go.Heatmap(
+            z=_z_hm2, x=_x_lbl2, y=_top10_rg_hm,
+            colorscale=[[0.0, "#EEF2FF"], [0.5, "#6366F1"], [1.0, "#3730A3"]],
+            text=[[str(v) if v > 0 else "" for v in row] for row in _z_hm2],
+            texttemplate="%{text}", textfont=dict(size=9, color="#fff"),
+            hovertemplate="<b>%{y}</b><br>%{x}: %{z:,}명<extra></extra>",
+            showscale=True, xgap=2, ygap=2,
+            colorbar=dict(title="환자수", thickness=12, len=0.8),
+        ))
+        _hm3_h = max(250, len(_top10_rg_hm) * 26 + 70)
+        _fig_hm3.update_layout(
+            **_PLOTLY_LAYOUT, height=_hm3_h,
+            margin=dict(l=0, r=60, t=8, b=8),
+        )
+        _fig_hm3.update_xaxes(side="top", tickfont=dict(size=9), tickangle=-45)
+        _fig_hm3.update_yaxes(tickfont=dict(size=10), autorange="reversed")
+        st.plotly_chart(_fig_hm3, use_container_width=True, key="reg_v3_heatmap")
+        st.markdown("</div>", unsafe_allow_html=True)
+        _gap()
+ 
+    # ══════════════════════════════════════
+    # [섹션3] TOP5 지역 카드 + MoM(전주/전기간) 증감
+    # ══════════════════════════════════════
+    st.markdown(
+        f'<div class="wd-card" style="border-top:3px solid {C["teal"]};">',
+        unsafe_allow_html=True,
+    )
+    _sec_hd(f"🏆 {_sel_dept} — 상위 지역 TOP 5",
+            f"{_period_label} · 전기간 대비 증감", C["teal"])
+ 
+    # 비교 기간 (직전 동일 기간)
+    _prev_cutoff = (
+        _today - _dt_r.timedelta(days=_n_days * 2)
+    ).strftime("%Y%m%d")
+    _prev_end = _cutoff  # = 이번 기간 시작 = 직전 기간 끝
+ 
+    _prev_data = [
+        _r for _r in region_data
+        if _r.get("진료과명", "") == _sel_dept
+        and str(_r.get("기준일자", "")) >= _prev_cutoff
+        and str(_r.get("기준일자", "")) < _cutoff
+    ]
+    _prev_region: dict = _ddr(int)
+    for _r in _prev_data:
+        _rg = _r.get("지역", "")
+        if _rg not in ("지역미상", "", None):
+            _prev_region[_rg] += int(_r.get("환자수", 0) or 0)
+ 
+    if _sorted_regions:
+        _top5_cols = st.columns(5, gap="small")
+        for _ti, (_rg_t, _rc_t) in enumerate(_sorted_regions[:5]):
+            _prev_cnt = _prev_region.get(_rg_t, 0)
+            _diff_t   = _rc_t - _prev_cnt
+            _chg_t    = (
+                f"{round(_diff_t / _prev_cnt * 100, 1):+.1f}%"
+                if _prev_cnt > 0 else "신규"
+            )
+            _arrow_t  = "▲" if _diff_t > 0 else "▼" if _diff_t < 0 else "─"
+            _dc_t     = C["red"] if _diff_t > 0 else C["blue"] if _diff_t < 0 else C["t3"]
+            _pct_t    = round(_rc_t / max(_known_total, 1) * 100, 1)
+            _bar_w_t  = round(_rc_t / max(_sorted_regions[0][1], 1) * 100)
+            _medals_t = ["🥇", "🥈", "🥉", "④", "⑤"]
+            _col_t    = _PALETTE[_ti % len(_PALETTE)]
+ 
+            with _top5_cols[_ti]:
+                st.markdown(
+                    f'<div style="background:#fff;border:1px solid #F0F4F8;'
+                    f'border-top:3px solid {_col_t};border-radius:10px;'
+                    f'padding:12px 10px;text-align:center;">'
+                    f'<div style="font-size:18px;">{_medals_t[_ti]}</div>'
+                    f'<div style="font-size:11px;font-weight:800;color:{_col_t};'
+                    f'margin:4px 0;line-height:1.3;word-break:keep-all;">{_rg_t}</div>'
+                    f'<div style="font-size:20px;font-weight:800;color:{C["t1"]};">'
+                    f'{_rc_t:,}<span style="font-size:11px;color:{C["t3"]};">명</span></div>'
+                    f'<div style="font-size:10px;color:{C["t3"]};margin-top:2px;">'
+                    f'점유율 {_pct_t}%</div>'
+                    f'<div style="height:4px;background:#F1F5F9;border-radius:2px;'
+                    f'margin:6px 0;overflow:hidden;">'
+                    f'<div style="width:{_bar_w_t}%;height:100%;background:{_col_t};'
+                    f'border-radius:2px;"></div></div>'
+                    f'<div style="font-size:11px;font-weight:700;color:{_dc_t};">'
+                    f'{_arrow_t} {_chg_t}</div>'
+                    f'<div style="font-size:9.5px;color:{C["t4"]};">전기간 대비</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+    else:
+        _plotly_empty()
+ 
+    st.markdown("</div>", unsafe_allow_html=True)
+    _gap()
+ 
+    # ══════════════════════════════════════
+    # [섹션4] 정적 경영 인사이트 요약
+    # (AI채팅 제거 — 하단 공통 채팅 사용)
+    # ══════════════════════════════════════
+    st.markdown(
+        f'<div class="wd-card" style="border-top:3px solid {C["violet"]};">',
+        unsafe_allow_html=True,
+    )
+    _sec_hd("📋 경영 인사이트 자동 요약",
+            f"{_sel_dept} · {_period_label} 데이터 기준", C["violet"])
+ 
+    # 의존도 진단
+    _dep_level = "🔴 위험" if _top1_dependency >= 60 else "🟡 주의" if _top1_dependency >= 40 else "🟢 양호"
+    _dep_msg   = (
+        f"1위 지역 <b>{_top1_region}</b> 점유율 <b>{_top1_dependency}%</b> — {_dep_level}<br>"
+        f"{'⚠️ 특정 지역 집중도가 높습니다. 인근 지역 홍보 강화가 필요합니다.' if _top1_dependency >= 40 else '✅ 지역 분산이 양호합니다.'}"
+    )
+ 
+    # 데이터 품질
+    _unk_pct = round(_unknown_total / max(_total_patients, 1) * 100, 1)
+    _unk_level = "🔴 불량" if _unk_pct >= 30 else "🟡 주의" if _unk_pct >= 10 else "🟢 양호"
+    _unk_msg   = (
+        f"지역미상 <b>{_unknown_total:,}명 ({_unk_pct}%)</b> — {_unk_level}<br>"
+        f"{'📋 접수 시 주소 입력 강화가 필요합니다.' if _unk_pct >= 10 else '✅ 주소 데이터 품질이 양호합니다.'}"
+    )
+ 
+    # 전기간 대비 이상징후 (TOP15 지역 중 ±30% 이상)
+    _anomaly_msgs = []
+    for _rg_a, _cv_a in _sorted_regions[:15]:
+        _pv_a = _prev_region.get(_rg_a, 0)
+        if _pv_a >= 3:
+            _chg_a = (_cv_a - _pv_a) / _pv_a * 100
+            if abs(_chg_a) >= 30:
+                _icon_a = "🔴" if _chg_a > 0 else "🔵"
+                _anomaly_msgs.append(
+                    f"{_icon_a} <b>{_rg_a}</b> {_chg_a:+.1f}% "
+                    f"({_pv_a:,} → {_cv_a:,}명)"
+                )
+    _anom_msg = (
+        "<br>".join(_anomaly_msgs[:3])
+        if _anomaly_msgs
+        else "✅ 전기간 대비 급격한 변동 지역 없음"
+    )
+ 
+    # TOP3 지역
+    _top3_str = " > ".join(
+        f"<b>{r}</b> {c:,}명" for r, c in _sorted_regions[:3]
+    ) if _sorted_regions else "─"
+ 
+    _ins_items = [
+        ("📍 지역 의존도 진단", _dep_msg,  C["blue"]),
+        ("🗂️ 데이터 품질",     _unk_msg,  C["orange"]),
+        ("🚨 이상징후 탐지",   _anom_msg, C["red"] if _anomaly_msgs else C["green"]),
+        ("🏆 상위 3개 지역",   _top3_str, C["teal"]),
+    ]
+    _ins_cols = st.columns(2, gap="small")
+    for _ii2, (_ins_title, _ins_body, _ins_color) in enumerate(_ins_items):
+        with _ins_cols[_ii2 % 2]:
+            st.markdown(
+                f'<div style="background:#fff;border:1px solid #F0F4F8;'
+                f'border-left:4px solid {_ins_color};border-radius:8px;'
+                f'padding:12px 14px;margin-bottom:8px;">'
+                f'<div style="font-size:11.5px;font-weight:700;color:{_ins_color};margin-bottom:6px;">'
+                f'{_ins_title}</div>'
+                f'<div style="font-size:12px;color:{C["t2"]};line-height:1.6;">'
+                f'{_ins_body}</div></div>',
+                unsafe_allow_html=True,
+            )
+ 
+    st.markdown(
+        f'<div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px;'
+        f'padding:9px 14px;margin-top:4px;display:flex;align-items:center;gap:8px;">'
+        f'<span style="font-size:14px;">🤖</span>'
+        f'<span style="font-size:12px;color:{C["blue"]};font-weight:600;">'
+        f'AI 심층 분석은 하단 채팅창에서 "{_sel_dept} 지역 분석해줘" 등으로 질문하세요'
+        f'</span></div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+    _gap()
+    
+    # ══════════════════════════════════════════════
+    # [섹션5] 부산/경남 지역 버블맵
+    # ══════════════════════════════════════════════
+    _gap(12)
+    _map_c1, _map_c2 = st.columns([1, 1], gap="small")
+    with _map_c1:
+        _render_tile_grid(
+            region_data=_filtered_data,
+            sido_prefix="부산",
+            grid_dict=_BUSAN_GRID,
+            title="🗺️ 부산 구군별 환자 분포",
+            color_main=C["blue"],
+            colorscale=[[0,"#EFF6FF"],[0.3,"#93C5FD"],[0.7,"#2563EB"],[1,"#1E3A8A"]],
+            chart_key=f"tile_busan_{_sel_dept}_{_n_days}",
+        )
+    with _map_c2:
+        _render_tile_grid(
+            region_data=_filtered_data,
+            sido_prefix="경남",
+            grid_dict=_GYEONGNAM_GRID,
+            title="🗺️ 경상남도 시군별 환자 분포",
+            color_main=C["green"],
+            colorscale=[[0,"#F0FDF4"],[0.3,"#6EE7B7"],[0.7,"#059669"],[1,"#064E3B"]],
+            chart_key=f"tile_gyeongnam_{_sel_dept}_{_n_days}",
+        )
+    _gap()
+
+
+    # ──────────────────────────────────────────────────────────────
+    # [섹션3] AI 경영 컨설팅 채팅
+    #
+    # [LLM 컨텍스트 설계]
+    #   · 집계값(지역명·환자수)만 전달 — 환자명/주민번호/카드번호 미포함
+    #   · 시스템 프롬프트: 병원 경영 분석 전문 컨설턴트 역할
+    #   · 10가지 필수 분석 항목 명시 (요구사항 반영)
+    # ──────────────────────────────────────────────────────────────
+    _gap()
+    st.markdown(
+        f'<div style="background:#fff;border:1px solid #E2E8F0;border-radius:12px;'
+        f'padding:14px 16px;border-top:3px solid {C["violet"]};">',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">'
+        f'<span style="font-size:16px;">🤖</span>'
+        f'<span style="font-size:13px;font-weight:700;color:{C["t1"]};">'
+        f'AI 경영 컨설팅 분석</span>'
+        f'<span style="background:{C["violet_l"]};color:{C["violet"]};border-radius:5px;'
+        f'padding:2px 8px;font-size:10.5px;font-weight:700;">병원 경영 분석 전문</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+ 
+    
+    # 월별 TOP3 지역 추이 (LLM 입력용)
+    _trend_ctx: dict = _ddr(lambda: _ddr(int))
+    for _r in _filtered_data:
+        # 기준일자(YYYYMMDD)를 기준년월(YYYYMM)로 변환
+        _dj = str(_r.get("기준일자", ""))
+        _ym8 = _dj[:6] if len(_dj) >= 6 else ""
+        _rg8 = _r.get("지역", "")
+        if _ym8 and _rg8 and _rg8 != "지역미상":
+            _trend_ctx[_ym8][_rg8] += int(_r.get("환자수", 0) or 0)
+ 
+    _trend_summary = {
+        _ym8: [{"지역": r, "환자수": c}
+               for r, c in sorted(_rgs.items(), key=lambda x: -x[1])[:3]]
+        for _ym8, _rgs in sorted(_trend_ctx.items())
+    }
+    
+    # 월별 분석 메타데이터
+    _target_months = list(sorted(_trend_ctx.keys()))
+    _n_months = len(_target_months)
+    _unique_depts = 1  # 현재는 선택된 단일 진료과만 분석
+
+    # 이상징후 탐지 (MoM 증감)
+    _anomalies: list = []
+    _sorted_months_ctx = sorted(_trend_ctx.keys())
+    if len(_sorted_months_ctx) >= 2:
+        _prev_ym = _sorted_months_ctx[-2]
+        _curr_ym = _sorted_months_ctx[-1]
+        _prev_rgs = _trend_ctx.get(_prev_ym, {})
+        _curr_rgs = _trend_ctx.get(_curr_ym, {})
+        _all_rgs_ctx = set(list(_prev_rgs.keys()) + list(_curr_rgs.keys()))
+        for _rg_an in _all_rgs_ctx:
+            _pv_an = _prev_rgs.get(_rg_an, 0)
+            _cv_an = _curr_rgs.get(_rg_an, 0)
+            if _pv_an > 10:  # 소수 샘플 필터
+                _chg = round((_cv_an - _pv_an) / _pv_an * 100, 1)
+                if abs(_chg) >= 30:  # 30% 이상 변동만 포함
+                    _anomalies.append({
+                        "지역": _rg_an,
+                        "전월": _pv_an,
+                        "당월": _cv_an,
+                        "변동률": f"{_chg:+.1f}%",
+                    })
+        _anomalies = sorted(_anomalies, key=lambda x: abs(float(x["변동률"].replace("%",""))), reverse=True)[:5]
+    
+    # 진료과별 TOP5지역 컨텍스트 (현재는 단일 진료과)
+    _dept_region_ctx = {
+        _sel_dept: [{"지역": r, "환자수": c} for r, c in _sorted_regions[:5]]
+    } if _sorted_regions else {}
+ 
+    _ai_ctx = {
+        "분석_진료과": _sel_dept,
+        "분석_기간": f"최근 {_n_months}개월 ({', '.join(sorted(_target_months))})" if _target_months else "데이터 없음",
+        "총_환자수": _total_patients,
+        "유입_지역수": _unique_regions,
+        "집계_진료과수": _unique_depts,
+        "1위_지역": {"지역": _top1_region, "환자수": _top1_cnt},
+        "진료과별_TOP5지역": _dept_region_ctx,
+        "월별_상위3지역_추이": _trend_summary,
+        "이상징후_탐지(MoM±30%이상)": _anomalies,
+    }
+ 
+    # ── 시스템 프롬프트 (병원 경영 분석 전문)
+    _sys_consulting = (
+        "당신은 대학병원 경영 전략 컨설턴트입니다.\n"
+        "아래 [지역별 환자 통계 데이터]를 분석하여 "
+        "병원 경영 의사결정에 활용 가능한 컨설팅 보고서를 작성하세요.\n\n"
+        "## 필수 분석 항목 (모두 포함)\n"
+        "1. **지역 유입 패턴** — 증가/감소 지역 식별 및 원인 추론\n"
+        "2. **지역 의존도 분석** — 특정 지역 편중 리스크 평가 (지역 집중도 HHI 개념 활용)\n"
+        "3. **병원 영향권 변화** — 진료권 확대/축소 및 상권 변화 해석\n"
+        "4. **이상징후 탐지** — 급증·급감(±30% 이상) 지역 경고 및 대응 방안\n"
+        "5. **신규 환자 유입 지역** — 신규 유입 강화 가능 지역 탐지\n"
+        "6. **진료과별 지역 비교** — 진료과별 환자 유입 패턴 차이 해석\n"
+        "7. **지역 점유율 변화** — 월별 지역 점유율 추이 분석\n"
+        "8. **경쟁 환경 추론** — 타 의료기관 영향 가능성\n"
+        "9. **마케팅 전략** — 지역별 홍보·마케팅 투자 우선순위 제안\n"
+        "10. **경영 개선 전략** — 진료권 확대를 위한 구체적 실행 계획\n\n"
+        "## 출력 형식\n"
+        "- 컨설팅 보고서 수준 (실제 병원 운영 관점)\n"
+        "- 단순 데이터 나열 금지 — 해석·전략 중심\n"
+        "- ⚠️ 위험/주의, ✅ 기회/강점, 📋 조치사항, 🔴 이상징후 이모지 활용\n"
+        "- 핵심 수치는 **굵게** 표시\n"
+        "- 개인 환자 정보(환자명, 주민번호, 연락처 등) 언급 절대 금지\n\n"
+        f"## [지역별 환자 통계 데이터]\n"
+        f"```json\n{_json_r.dumps(_ai_ctx, ensure_ascii=False, indent=2)[:6000]}\n```"
+    )
+ 
+    # ── 빠른 분석 버튼 4개
+    _quick_r = [
+        (
+            "🔍 종합 분석",
+            "위 데이터를 기반으로 지역 유입 패턴, 의존도 리스크, 영향권 변화, "
+            "이상징후, 마케팅 전략을 포함한 종합 경영 컨설팅 보고서를 작성해주세요.",
+        ),
+        (
+            "📍 지역 의존도",
+            f"{'전체' if _sel_dept == '전체' else _sel_dept} 데이터에서 특정 지역 의존도(편중도)를 "
+            "분석하고, 의존도 리스크와 지역 다변화 전략을 제시해주세요.",
+        ),
+        (
+            "🚨 이상징후 탐지",
+            "월별 데이터에서 환자수 급증·급감(30% 이상) 이상징후를 탐지하고, "
+            "원인 가설 3가지와 각 대응 방안을 제시해주세요.",
+        ),
+        (
+            "🎯 진료권 확대 전략",
+            "환자 유입 데이터를 기반으로 진료권 확대 가능 지역을 선정하고, "
+            "지역별 마케팅 전략과 구체적 실행 계획을 컨설팅 보고서로 작성해주세요.",
+        ),
+    ]
+    _qr_cols = st.columns(len(_quick_r), gap="small")
+    for _qi2, (_ql2, _qv2) in enumerate(_quick_r):
+        with _qr_cols[_qi2]:
+            if st.button(_ql2, key=f"reg_qs_{_qi2}", use_container_width=True, type="secondary"):
+                st.session_state["reg_chat_prefill"] = _qv2
+                st.rerun()
+ 
+    # ── 채팅 히스토리 초기화 버튼
+    if st.session_state.get("reg_chat_history"):
+        if st.button("🗑️ 대화 초기화", key="reg_chat_clear", type="secondary"):
+            st.session_state["reg_chat_history"] = []
+            st.rerun()
+ 
+    # ── 채팅 히스토리 렌더링
+    if "reg_chat_history" not in st.session_state:
+        st.session_state["reg_chat_history"] = []
+    _reg_history = st.session_state["reg_chat_history"]
+ 
+    for _msg in _reg_history:
+        with st.chat_message(_msg["role"]):
+            st.markdown(_msg["content"])
+ 
+    # ── 입력 처리 (prefill 또는 직접 입력)
+    _reg_prefill = st.session_state.pop("reg_chat_prefill", None)
+    _reg_input   = (
+        st.chat_input("지역별 경영 분석을 질문하세요", key="reg_chat_input")
+        or _reg_prefill
+    )
+ 
+    if _reg_input:
+        with st.chat_message("user"):
+            st.markdown(_reg_input)
+        _reg_history.append({"role": "user", "content": _reg_input})
+ 
+        with st.chat_message("assistant"):
+            _ph2 = st.empty()
+            _toks2: list = []
+            _full2 = ""
+            try:
+                from core.llm import get_llm_client
+                _llm2 = get_llm_client()
+                # 시스템 프롬프트 6000자 초과 시 안전 절단
+                _safe_sys = (
+                    _sys_consulting[:5500] + "\n...(생략)"
+                    if len(_sys_consulting) > 5500
+                    else _sys_consulting
+                )
+                for _tok2 in _llm2.generate_stream(
+                    _reg_input,
+                    _safe_sys,
+                    request_id=_uuid_r.uuid4().hex[:8],
+                ):
+                    _toks2.append(_tok2)
+                    if len(_toks2) % 4 == 0:
+                        _ph2.markdown("".join(_toks2) + "▌")
+                _full2 = "".join(_toks2)
+            except Exception as _e2:
+                # LLM 실패 시 데이터 요약만 제공 (폴백)
+                _top3_str = " / ".join(
+                    f"{r['지역']} {r['환자수']:,}명"
+                    for r in list(_dept_region_ctx.values())[0][:3]
+                    if _dept_region_ctx
+                ) or "데이터 없음"
+                _full2 = (
+                    f"**⚠️ LLM 연결 실패** `{_e2}`\n\n"
+                    f"**현재 데이터 요약** (AI 분석 불가 시 참고)\n"
+                    f"- 분석 과: **{_sel_dept}**\n"
+                    f"- 총 환자: **{_total_patients:,}명** (최근 {_n_months}개월)\n"
+                    f"- 1위 지역: **{_top1_region}** ({_top1_cnt:,}명)\n"
+                    f"- 유입 지역수: **{_unique_regions}개** 시구\n"
+                    f"- 상위 지역: {_top3_str}\n\n"
+                    f"*LLM 서버 연결 후 재질문하시면 컨설팅 보고서를 제공합니다.*"
+                )
+            _ph2.markdown(_full2)
+ 
+        _reg_history.append({"role": "assistant", "content": _full2})
+        st.session_state["reg_chat_history"] = _reg_history
+        st.rerun()
+ 
+    st.markdown("</div>", unsafe_allow_html=True)  # AI 채팅 카드 닫기
+ 
+ 
 
 # ════════════════════════════════════════════════════════════════════
-# 카드 매칭 탭
+# 카드 매칭 탭  (기존 _tab_card_match 그대로 — 내용 동일)
 # ════════════════════════════════════════════════════════════════════
 def _tab_card_match() -> None:
     import io, datetime as _dt_cm
@@ -1524,22 +2881,17 @@ def _tab_card_match() -> None:
     if _db_ok:
         _db_badge = (f'<span style="background:{C["green"]}1A;color:{C["green"]};border-radius:5px;padding:2px 8px;font-size:11px;font-weight:700;">✅ DB 연결 ({len(_hosp_rows):,}건)</span>')
     else:
-        _db_badge = (
-            f'<span style="background:{C["red"]}1A;color:{C["red"]};border-radius:5px;padding:2px 8px;font-size:11px;font-weight:700;">❌ VIEW 조회 실패</span>'
-            f'<span style="font-size:10.5px;color:{C["t3"]};margin-left:6px;">DBeaver(관리자)에서 V_KIOSK_CARD_APPROVAL 생성 후 GRANT SELECT TO RAG_READONLY 실행</span>'
-        )
-    st.markdown(
-        f'<div style="margin:6px 0 8px;display:flex;align-items:center;gap:8px;">'
-        f'<span style="font-size:11px;color:{C["t3"]};">병원 DB 현황:</span>{_db_badge}'
-        f'<span style="font-size:10.5px;color:{C["t3"]};">{_cm_date_str} ±2일 / 총 {len(_hosp_rows):,}건</span></div>',
-        unsafe_allow_html=True,
-    )
+        _db_badge = (f'<span style="background:{C["red"]}1A;color:{C["red"]};border-radius:5px;padding:2px 8px;font-size:11px;font-weight:700;">❌ VIEW 조회 실패</span>'
+                     f'<span style="font-size:10.5px;color:{C["t3"]};margin-left:6px;">DBeaver(관리자)에서 V_KIOSK_CARD_APPROVAL 생성 후 GRANT SELECT TO RAG_READONLY 실행</span>')
+    st.markdown(f'<div style="margin:6px 0 8px;display:flex;align-items:center;gap:8px;">'
+                f'<span style="font-size:11px;color:{C["t3"]};">병원 DB 현황:</span>{_db_badge}'
+                f'<span style="font-size:10.5px;color:{C["t3"]};">{_cm_date_str} ±2일 / 총 {len(_hosp_rows):,}건</span></div>', unsafe_allow_html=True)
 
     _df_card = None
     if uploaded:
         try:
             import pandas as pd
-            _bytes  = uploaded.read()
+            _bytes = uploaded.read()
             _df_raw = pd.read_excel(io.BytesIO(_bytes), dtype=str)
             _df_raw.columns = [str(c).strip() for c in _df_raw.columns]
             _missing = {"승인일시","승인번호","승인금액"} - set(_df_raw.columns)
@@ -1576,10 +2928,7 @@ def _tab_card_match() -> None:
             st.error("❌ 병원 DB 연결 실패"); st.markdown("</div>", unsafe_allow_html=True); return
         if _df_card is None:
             st.warning("⚠️ 카드사 파일을 먼저 업로드하세요."); st.markdown("</div>", unsafe_allow_html=True); return
-        _hosp_dict = {
-            str(_hr.get("승인번호","") or "").strip().replace(" ",""): _hr
-            for _hr in _hosp_rows if str(_hr.get("승인번호","") or "").strip()
-        }
+        _hosp_dict = {str(_hr.get("승인번호","") or "").strip().replace(" ",""): _hr for _hr in _hosp_rows if str(_hr.get("승인번호","") or "").strip()}
         _card_dict = {}
         for _, _crow in _df_card.iterrows():
             _cno = str(_crow.get("_apv_no","")).strip()
@@ -1604,8 +2953,7 @@ def _tab_card_match() -> None:
                 if _hno not in _card_matched:
                     _results.append({"상태":"병원만","거래일자":str(_hr.get("거래일자",""))[:8],"승인번호":_hno,
                         "카드사금액":0,"병원금액":int(_hr.get("승인금액",0) or 0),
-                        "차이":-int(_hr.get("승인금액",0) or 0),
-                        "카드사":str(_hr.get("카드사명","")),"단말기ID":str(_hr.get("단말기ID","")),"설치위치":str(_hr.get("설치위치","")),"출처":"병원만"})
+                        "차이":-int(_hr.get("승인금액",0) or 0),"카드사":str(_hr.get("카드사명","")),"단말기ID":str(_hr.get("단말기ID","")),"설치위치":str(_hr.get("설치위치","")),"출처":"병원만"})
         else:
             for _hno, _hr in _hosp_dict.items():
                 _hamt = int(_hr.get("승인금액",0) or 0); _crow = _card_dict.get(_hno)
@@ -1638,14 +2986,10 @@ def _tab_card_match() -> None:
     _gap()
     kc1,kc2,kc3,kc4,kc5 = st.columns(5, gap="small")
     def _cm_kpi(col,icon,label,val,color,sub=""):
-        col.markdown(
-            f'<div class="fn-kpi" style="border-top:3px solid {color};min-height:90px;">'
-            f'<div class="fn-kpi-icon">{icon}</div>'
-            f'<div class="fn-kpi-label" style="font-size:9px;">{label}</div>'
-            f'<div class="fn-kpi-value" style="color:{color};font-size:26px;">{val}</div>'
-            f'<div class="fn-kpi-sub">{sub}</div></div>',
-            unsafe_allow_html=True,
-        )
+        col.markdown(f'<div class="fn-kpi" style="border-top:3px solid {color};min-height:90px;">'
+                     f'<div class="fn-kpi-icon">{icon}</div><div class="fn-kpi-label" style="font-size:9px;">{label}</div>'
+                     f'<div class="fn-kpi-value" style="color:{color};font-size:26px;">{val}</div>'
+                     f'<div class="fn-kpi-sub">{sub}</div></div>', unsafe_allow_html=True)
     _cm_kpi(kc1,"✅","정상 매칭",  f"{_cnt_ok:,}건",   C["green"],  f"매칭률 {_match_rate}%")
     _cm_kpi(kc2,"🔴","누락",       f"{_cnt_miss:,}건", C["red"],    "즉시 확인 필요")
     _cm_kpi(kc3,"🟡","금액불일치", f"{_cnt_amt:,}건",  C["yellow"], "금액 다름")
@@ -1686,10 +3030,8 @@ def _tab_card_match() -> None:
         '</tr></thead><tbody>'
     )
     _fmta = lambda v: f"{v:,}" if v else "─"
-    _fmtd = lambda v: (
-        f'<span style="color:#DC2626;font-weight:700;">▲{v:,}</span>' if v>0
-        else f'<span style="color:#2563EB;font-weight:700;">▼{abs(v):,}</span>' if v<0 else "─"
-    )
+    _fmtd = lambda v: (f'<span style="color:#DC2626;font-weight:700;">▲{v:,}</span>' if v>0
+                       else f'<span style="color:#2563EB;font-weight:700;">▼{abs(v):,}</span>' if v<0 else "─")
     for _i, _r in enumerate(_filtered[:500]):
         _st = _r["상태"]
         _bg, _tx, _ac, _badge = _STATUS_STYLE.get(_st, ("#F8FAFC","#334155","#334155",_st))
@@ -1769,6 +3111,7 @@ def render_finance_dashboard() -> None:
     # ── 주간/월간 분석
     los_dist_dept    = _fq("los_dist_dept")            # 신규 — 날짜 무관(현재 재원)
     monthly_opd_dept = _fq("monthly_opd_dept")         # 신규 — 최근 12개월
+    region_dept_data = _fq("region_dept_daily")   #← 날짜 파라미터 제거 (VIEW 자체 30일 고정)
 
     # ── 탑바
     st.markdown('<div class="fn-topbar"></div>', unsafe_allow_html=True)
@@ -1814,8 +3157,7 @@ def render_finance_dashboard() -> None:
         with _dc3:
             if st.session_state.get("fn_use_custom_date", False):
                 st.date_input("", value=st.session_state.get("fn_sel_date",_dt_main.date.today()),
-                              key="fn_sel_date", label_visibility="collapsed", format="YYYY-MM-DD",
-                              max_value=_dt_main.date.today())
+                              key="fn_sel_date", label_visibility="collapsed", format="YYYY-MM-DD", max_value=_dt_main.date.today())
                 _shown = st.session_state.get("fn_sel_date",_dt_main.date.today())
                 st.markdown(f'<div style="font-size:10px;color:{C["indigo"]};font-weight:700;text-align:center;">📅 {_shown} 기준</div>', unsafe_allow_html=True)
             else:
@@ -1828,6 +3170,7 @@ def render_finance_dashboard() -> None:
             "V_OPD_DEPT_STATUS","V_KIOSK_STATUS","V_DISCHARGE_PIPELINE",
             "V_FINANCE_TODAY","V_FINANCE_TREND","V_FINANCE_BY_DEPT","V_OVERDUE_STAT",
             "V_IPD_DEPT_TREND(신규)","V_LOS_DIST_DEPT(신규)","V_MONTHLY_OPD_DEPT(신규)",
+             "V_region_dept_daily(지역분석·신규)"
         ]
         st.markdown(
             f'<div style="background:#FFFBEB;border:1px solid #FDE68A;border-radius:8px;padding:8px 14px;margin-bottom:8px;">'
@@ -1837,12 +3180,13 @@ def render_finance_dashboard() -> None:
         )
 
     # ════════════════════════════════════════════════════════════════
-    # 4탭 구조
+    # 5탭 구조
     # ════════════════════════════════════════════════════════════════
-    t1, t_weekly, t_monthly, t_card = st.tabs([
+    t1, t_weekly, t_monthly, t_region, t_card = st.tabs([
         "🏥 실시간 현황",
         "📈 주간추이분석",
         "📅 월간추이분석",
+        "📍 지역별 통계",    # ← 신규
         "💳 카드 매칭",
     ])
 
@@ -1868,6 +3212,9 @@ def render_finance_dashboard() -> None:
 
     with t_monthly:
         _tab_monthly(monthly_opd_dept)
+
+    with t_region:
+        _tab_region(region_dept_data)
 
     with t_card:
         _tab_card_match()

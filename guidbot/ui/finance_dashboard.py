@@ -23,12 +23,14 @@ ui/finance_dashboard.py  ─  원무 현황 대시보드 v2.3
   V_LOS_DIST       (진료과별 분포 V_LOS_DIST_DEPT 로 대체)
 """
 
+
 from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 import streamlit as st
 import json as _json_r
 import uuid as _uuid_r
+
 
 try:
     import plotly.graph_objects as go
@@ -1451,6 +1453,349 @@ def _render_day_inweon(day_inweon: list) -> None:
         st.markdown('<div style="padding:28px;text-align:center;color:#94A3B8;font-size:13px;">V_DAY_INWEON_3 데이터 없음</div>', unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
+    return
+
+    # ── 격자 Z 행렬 구성
+    _max_col = max(c for c, r in grid_dict.values())
+    _max_row = max(r for c, r in grid_dict.values())
+
+    # float('nan') = 빈 셀 (투명)
+    _z    = [[float("nan")] * (_max_col + 1) for _ in range(_max_row + 1)]
+    _text = [[""] * (_max_col + 1) for _ in range(_max_row + 1)]
+
+    for _nm, (_col, _row) in grid_dict.items():
+        _c = _cnt.get(_nm, 0)
+        _z[_row][_col]    = float(_c)
+        _text[_row][_col] = f"{_nm}<br>{_c:,}명"
+
+    # NaN 셀 → 0으로 처리하되 텍스트는 비워두기
+    # (colorscale 에서 0 = 가장 연한 색 → 빈 셀처럼 보임)
+    # 실제로 NaN은 투명하게 처리됨
+
+    _max_v = max(_cnt.values()) if _cnt else 1
+
+    _fig = go.Figure(go.Heatmap(
+        z=_z,
+        text=_text,
+        texttemplate="%{text}",
+        textfont=dict(size=9, color="#1E293B"),
+        colorscale=colorscale,
+        zmin=0,
+        zmax=_max_v,
+        showscale=True,
+        hovertemplate="%{text}<extra></extra>",
+        xgap=4,
+        ygap=4,
+        colorbar=dict(
+            title=dict(text="환자수", font=dict(size=11)),
+            thickness=13,
+            len=0.75,
+            tickformat=",",
+            tickfont=dict(size=10),
+        ),
+    ))
+
+    _fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=350,
+        margin=dict(l=0, r=0, t=4, b=0),
+        xaxis=dict(visible=False, showgrid=False, zeroline=False),
+        yaxis=dict(visible=False, showgrid=False, zeroline=False, autorange="reversed"),
+    )
+
+    st.plotly_chart(_fig, use_container_width=True, key=chart_key)
+
+    # ── 구군 순위 보조 바 (TOP 12)
+    _sorted_cnt = sorted(_cnt.items(), key=lambda x: -x[1])
+    _max_bar    = _sorted_cnt[0][1] if _sorted_cnt else 1
+    _medals     = ["🥇", "🥈", "🥉"]
+    _bar_html   = (
+        '<div style="display:flex;flex-wrap:wrap;gap:5px 16px;'
+        'margin-top:8px;padding-top:8px;border-top:1px solid #F1F5F9;">'
+    )
+    for _i, (_gn, _gc) in enumerate(_sorted_cnt[:12]):
+        _pct_b = round(_gc / max(_max_bar, 1) * 100)
+        _md = _medals[_i] if _i < 3 else (
+            f'<span style="font-size:10px;color:#94A3B8;font-weight:700;">{_i+1}</span>'
+        )
+        _bar_html += (
+            f'<div style="display:flex;align-items:center;gap:5px;'
+            f'min-width:186px;flex:1 0 186px;">'
+            f'<div style="width:22px;text-align:center;">{_md}</div>'
+            f'<div style="width:52px;font-size:11px;font-weight:600;color:#334155;'
+            f'white-space:nowrap;">{_gn}</div>'
+            f'<div style="flex:1;height:8px;background:#F1F5F9;border-radius:4px;overflow:hidden;">'
+            f'<div style="width:{_pct_b}%;height:100%;background:{color_main};'
+            f'border-radius:4px;opacity:0.78;"></div></div>'
+            f'<div style="width:44px;font-size:11px;font-family:Consolas;'
+            f'font-weight:700;color:{color_main};text-align:right;">{_gc:,}</div>'
+            f'</div>'
+        )
+    _bar_html += "</div>"
+    st.markdown(_bar_html, unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ════════════════════════════════════════════════════════════════════
+# 지역 지도 시각화 — folium 버전 (외부 인터넷 연결 필요)
+# pip install streamlit-folium folium
+# ════════════════════════════════════════════════════════════════════
+from collections import defaultdict as _ddm   # ← _render_folium_map 에서 사용
+
+try:
+    import folium
+    from streamlit_folium import st_folium
+    HAS_FOLIUM = True
+except ImportError:
+    HAS_FOLIUM = False
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _load_sigungu_geojson_cached() -> Optional[dict]:
+    
+    try:
+        import requests as _req
+        _r = _req.get(
+            "https://raw.githubusercontent.com/southkorea/"
+            "southkorea-maps/master/kostat/2013/json/skorea_municipalities_geo.json",
+            timeout=10,
+        )
+        _r.raise_for_status()
+        return _r.json()
+    except Exception as _e:
+        logger.warning(f"[GeoJSON] 로드 실패: {_e}")
+        return None
+
+    # ❗ 최종 fallback (로컬 파일)
+    try:
+        with open("data/sigungu.geojson", "r", encoding="utf-8") as f:
+            logger.warning("[GeoJSON] 로컬 파일로 fallback")
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"[GeoJSON] 로컬 fallback 실패: {e}")
+        return None
+
+def _hex_to_rgb(h: str) -> tuple:
+    h = h.lstrip("#")
+    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+
+def _interpolate_color(t: float, stops: list) -> str:
+    for i in range(len(stops) - 1):
+        p0, c0 = stops[i];  p1, c1 = stops[i + 1]
+        if p0 <= t <= p1:
+            lt = (t - p0) / (p1 - p0) if p1 > p0 else 0
+            r0,g0,b0 = _hex_to_rgb(c0);  r1,g1,b1 = _hex_to_rgb(c1)
+            return f"#{int(r0+(r1-r0)*lt):02X}{int(g0+(g1-g0)*lt):02X}{int(b0+(b1-b0)*lt):02X}"
+    return stops[-1][1]
+
+# 이 파일의 내용으로 finance_dashboard.py 의 _render_folium_map 함수 전체를 교체하세요.
+# (함수 시작 def _render_folium_map( 부터 마지막 st.markdown('</div>') 까지)
+# ════════════════════════════════════════════════════════════════════
+# 부산 / 경남 구군명 목록 — GeoJSON 코드 기반 필터 대체
+# ════════════════════════════════════════════════════════════════════
+_BUSAN_DISTRICTS: set = {
+    "중구","서구","동구","영도구","부산진구","동래구",
+    "남구","북구","해운대구","사하구","금정구","강서구",
+    "연제구","수영구","사상구","기장군",
+}
+_GYEONGNAM_DISTRICTS: set = {
+    "창원시","진주시","통영시","사천시","김해시","밀양시",
+    "거제시","양산시","의령군","함안군","창녕군","고성군",
+    "남해군","하동군","산청군","함양군","거창군","합천군",
+}
+
+
+def _render_folium_map(
+    region_data: list,
+    sig_cd_prefix: str,          # 사용 안 함(하위 호환 유지용)
+    title: str,
+    color_main: str,
+    color_stops: list,
+    center: list,
+    zoom_start: int,
+    chart_key: str,
+    height: int = 440,
+    district_set: set = None,    # _BUSAN_DISTRICTS 또는 _GYEONGNAM_DISTRICTS
+) -> None:
+    """
+    Folium 단계구분도 v4 — 구군명 목록 기반 필터링.
+
+    GeoJSON 내부 코드(3738 등 순번)가 행정코드가 아닌 경우에도
+    district_set 로 원하는 구군만 정확히 추출합니다.
+    """
+    st.markdown(
+        f'<div class="wd-card" style="border-top:3px solid {color_main};">',
+        unsafe_allow_html=True,
+    )
+    _sec_hd(title, "클릭 → 팝업(환자수·점유율) · 색상 강도 = 환자수", color_main)
+
+    if not HAS_FOLIUM:
+        st.warning("streamlit-folium 미설치: `pip install streamlit-folium folium`")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    _raw_geojson = _load_sigungu_geojson_cached()
+    if _raw_geojson is None:
+        st.error("GeoJSON 로드 실패 — 인터넷 연결 확인")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    # ── 속성 필드 자동 감지 (이름 컬럼)
+    _p0 = (_raw_geojson.get("features") or [{}])[0].get("properties", {})
+    _name_key = next(
+        (k for k in ("SIG_KOR_NM", "name", "NM", "adm_nm", "sggnm") if k in _p0),
+        None,
+    )
+    if not _name_key:
+        st.error(f"GeoJSON 이름 필드 감지 실패. 속성: {list(_p0.keys())[:10]}")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    def _prop_name(f: dict) -> str:
+        return str(f.get("properties", {}).get(_name_key, "") or "").strip()
+
+    # ── district_set 으로 feature 필터
+    _target = district_set or _BUSAN_DISTRICTS
+    _features = [f for f in _raw_geojson.get("features", [])
+                 if _prop_name(f) in _target]
+
+    if not _features:
+        st.warning("GeoJSON에서 해당 구군을 찾지 못했습니다.")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    _geojson = {"type": "FeatureCollection", "features": _features}
+
+    # ── DB 데이터 집계
+    _registered = {_prop_name(f) for f in _features}
+    _cnt: dict = _ddm(int)
+    for _r in region_data:
+        _rg  = str(_r.get("지역", "") or "").strip()
+        _val = int(_r.get("환자수", 0) or 0)
+        if not _rg:
+            continue
+        _gu = _rg.rsplit(" ", 1)[-1]   # "부산광역시 해운대구" → "해운대구"
+        if _gu in _registered:
+            _cnt[_gu] += _val
+
+    if not _cnt:
+        st.info("해당 진료과·기간의 지역 데이터 없음")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    _total     = sum(_cnt.values()) or 1
+    _max_v     = max(_cnt.values())
+    _sorted_rg = sorted(_cnt.items(), key=lambda x: -x[1])
+
+    # ── Folium 지도
+    _m = folium.Map(
+        location=center,
+        zoom_start=zoom_start,
+        tiles="CartoDB positron",
+        prefer_canvas=True,
+    )
+
+    def _style_fn(feature):
+        _t = _cnt.get(_prop_name(feature), 0) / _max_v if _max_v > 0 else 0
+        return {
+            "fillColor":   _interpolate_color(_t, color_stops),
+            "color":       "white",
+            "weight":      1.5,
+            "fillOpacity": 0.82,
+        }
+
+    def _highlight_fn(feature):
+        return {"fillColor": color_main, "color": "#334155",
+                "weight": 2.5, "fillOpacity": 0.95}
+
+    folium.GeoJson(
+        _geojson,
+        style_function=_style_fn,
+        highlight_function=_highlight_fn,
+        tooltip=folium.GeoJsonTooltip(
+            fields=[_name_key], aliases=["구군:"],
+            style=(
+                "background-color:white;color:#0F172A;"
+                "font-family:'Malgun Gothic',sans-serif;"
+                "font-size:12px;font-weight:700;padding:4px 8px;"
+            ),
+        ),
+    ).add_to(_m)
+
+    for _f in _features:
+        _nm   = _prop_name(_f)
+        _v    = _cnt.get(_nm, 0)
+        _pct  = round(_v / _total * 100, 1)
+        _rank = next((i+1 for i,(k,_) in enumerate(_sorted_rg) if k == _nm), "─")
+        _popup_html = (
+            f'<div style="font-family:Malgun Gothic,sans-serif;min-width:160px;padding:4px;">'
+            f'<div style="font-size:14px;font-weight:800;color:{color_main};'
+            f'border-bottom:2px solid {color_main};padding-bottom:4px;margin-bottom:8px;">📍 {_nm}</div>'
+            f'<table style="width:100%;font-size:12px;">'
+            f'<tr><td style="color:#64748B;padding:3px 0;">환자수</td>'
+            f'<td style="font-weight:700;text-align:right;">{_v:,}명</td></tr>'
+            f'<tr><td style="color:#64748B;padding:3px 0;">점유율</td>'
+            f'<td style="font-weight:700;color:{color_main};text-align:right;">{_pct}%</td></tr>'
+            f'<tr><td style="color:#64748B;padding:3px 0;">순위</td>'
+            f'<td style="font-weight:700;text-align:right;">{_rank}위</td></tr>'
+            f'</table>'
+            f'<div style="margin-top:6px;height:6px;background:#F1F5F9;border-radius:3px;">'
+            f'<div style="width:{_pct}%;height:100%;background:{color_main};border-radius:3px;opacity:0.8;"></div>'
+            f'</div></div>'
+        )
+        folium.GeoJson(
+            _f, style_function=_style_fn,
+            popup=folium.Popup(folium.IFrame(_popup_html, width=190, height=145), max_width=200),
+        ).add_to(_m)
+
+    # 범례
+    _legend_html = (
+        f'<div style="position:fixed;bottom:20px;right:10px;z-index:1000;'
+        f'background:white;padding:10px 14px;border-radius:8px;'
+        f'border:1px solid #E2E8F0;box-shadow:0 2px 8px rgba(0,0,0,.12);">'
+        f'<div style="font-size:11px;font-weight:700;color:{color_main};margin-bottom:6px;">환자수(명)</div>'
+    )
+    for _li in range(5):
+        _t_val = _li / 4
+        _lc = _interpolate_color(_t_val, color_stops)
+        _legend_html += (
+            f'<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px;">'
+            f'<div style="width:16px;height:12px;background:{_lc};border-radius:2px;"></div>'
+            f'<span style="font-size:10px;color:#334155;">{int(_max_v*_t_val):,}</span></div>'
+        )
+    _legend_html += "</div>"
+    _m.get_root().html.add_child(folium.Element(_legend_html))
+
+    st_folium(_m, key=chart_key, height=height, width="stretch", returned_objects=[])
+
+    # 순위 바
+    _max_bar = _sorted_rg[0][1] if _sorted_rg else 1
+    _medals  = ["🥇","🥈","🥉"]
+    _bar_html = (
+        '<div style="display:flex;flex-wrap:wrap;gap:5px 16px;'
+        'margin-top:8px;padding-top:8px;border-top:1px solid #F1F5F9;">'
+    )
+    for _i, (_gn, _gc) in enumerate(_sorted_rg[:12]):
+        _pct_b = round(_gc / max(_max_bar, 1) * 100)
+        _share = round(_gc / _total * 100, 1)
+        _md = (_medals[_i] if _i < 3
+               else f'<span style="font-size:10px;color:#94A3B8;font-weight:700;">{_i+1}</span>')
+        _bar_html += (
+            f'<div style="display:flex;align-items:center;gap:5px;min-width:200px;flex:1 0 200px;">'
+            f'<div style="width:22px;text-align:center;">{_md}</div>'
+            f'<div style="width:52px;font-size:11px;font-weight:600;color:#334155;white-space:nowrap;">{_gn}</div>'
+            f'<div style="flex:1;height:8px;background:#F1F5F9;border-radius:4px;overflow:hidden;">'
+            f'<div style="width:{_pct_b}%;height:100%;background:{color_main};border-radius:4px;opacity:0.78;"></div></div>'
+            f'<div style="width:44px;font-size:11px;font-family:Consolas;font-weight:700;'
+            f'color:{color_main};text-align:right;">{_gc:,}</div>'
+            f'<div style="width:36px;font-size:10px;color:#94A3B8;text-align:right;">{_share}%</div>'
+            f'</div>'
+        )
+    _bar_html += "</div>"
+    st.markdown(_bar_html, unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
 
 def _tab_region(region_data: List[Dict]) -> None:
     """
@@ -1968,6 +2313,38 @@ def _tab_region(region_data: List[Dict]) -> None:
     st.markdown("</div>", unsafe_allow_html=True)
     _gap()
     
+    # ══════════════════════════════════════════════
+    # [섹션5] 부산/경남 지역 버블맵
+    # ══════════════════════════════════════════════
+    _gap(12)
+    _map_c1, _map_c2 = st.columns([1, 1], gap="small")
+    with _map_c1:
+        _render_folium_map(
+            region_data=_filtered_data,
+            sig_cd_prefix="26",            # 하위호환 유지
+            title="🗺️ 부산 구군별 환자 분포",
+            color_main=C["blue"],
+            color_stops=[(0.0,"#EFF6FF"),(0.2,"#BAE6FD"),(0.5,"#3B82F6"),(0.8,"#1D4ED8"),(1.0,"#0C2D48")],
+            center=[35.12, 129.04],        # ← 부산 중심 조정
+            zoom_start=11,
+            chart_key=f"folium_busan_{_sel_dept}_{_n_days}",
+            district_set=_BUSAN_DISTRICTS, # ← 추가
+        )
+    with _map_c2:
+        _render_folium_map(
+            region_data=_filtered_data,
+            sig_cd_prefix="48",
+            title="🗺️ 경상남도 시군별 환자 분포",
+            color_main=C["green"],
+            color_stops=[(0.0,"#F0FDF4"),(0.2,"#BBF7D0"),(0.5,"#34D399"),(0.8,"#059669"),(1.0,"#064E3B")],
+            center=[35.40, 128.10],        # ← 경남 중심 조정
+            zoom_start=8,                  # ← 9 → 8 (경남 전체 보이게)
+            chart_key=f"folium_gyeongnam_{_sel_dept}_{_n_days}",
+            district_set=_GYEONGNAM_DISTRICTS, # ← 추가
+        )
+    _gap()
+
+
     # ──────────────────────────────────────────────────────────────
     # [섹션3] AI 경영 컨설팅 채팅
     #
