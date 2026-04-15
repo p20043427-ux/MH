@@ -295,6 +295,6 @@ def main() -> None:
             st.error(f"원무 대시보드 로드 오류\n\n{e}")
             logger.error(f"finance_app 렌더 오류: {e}", exc_info=True)
 
-
+ 
 if __name__ == "__main__":
     main()
